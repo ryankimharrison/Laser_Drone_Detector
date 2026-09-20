@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------
+# Laser Turret
+# Rule of thumb: source, docs, firmware and calibration are tracked.
+# Captured data, trained weights and run output are NOT -- they are
+# large, regenerable, and specific to one rig / one session.
+# ---------------------------------------------------------------
+
+# --- Large data: captured footage, labels, training sets (~3 GB) ---
+dataset/
+
+# --- Model weights / checkpoints (~400 MB; GitHub rejects >100 MB files) ---
+weights/
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+
+# --- Training + evaluation output ---
+runs/
+
+# --- Session artifacts: recorded runs, diagnostics, firmware snapshots ---
+diag/
+snapshots/
+
+# --- Python ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS junk ---
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store
+
+# --- Secrets / local config (none in the tree today; keep it that way) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+
+# --- KiCad autosave / backup clutter (keep the real project files) ---
+*-backups/
+*.kicad_pcb-bak
+*.kicad_sch-bak
+_autosave-*
+fp-info-cache
+
+# --- Loose capture output that lands in the repo root ---
+/*.mp4
+/*.avi
+/*.log
+
+turret_host/calibration
+turret_host/assets

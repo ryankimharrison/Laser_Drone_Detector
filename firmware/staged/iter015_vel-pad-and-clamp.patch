@@ -1,0 +1,197 @@
+--- firmware/current/stepper.py
++++ firmware/current/stepper.py
+@@ -372,6 +372,22 @@
+ 
+     def enter_vel_mode(self):
+         if self.mode == "vel":
++            # ALREADY IN VELOCITY MODE -- but re-claim the STEP pad anyway.
++            #
++            # coordinated_move() has no velocity-mode guard (move() and
++            # single_step() both do), and its finally clause calls
++            # _release_step_pin() on BOTH axes, which hands the pad back to
++            # SIO. Returning early here meant the pad was never re-claimed:
++            # vel_tick went on writing periods and integrating _pos_micro
++            # while not one pulse reached the driver. That is a motor whose
++            # counter advances and whose shaft does not move, until reboot --
++            # measured on the bench 2026-09-20, tilt only, after a
++            # position-mode move on tilt.
++            #
++            # Claiming an already-claimed pad is a single register write and
++            # is harmless, so do it unconditionally rather than trying to
++            # guess whether something took it.
++            self._claim_step_pin_vel()
+             return
+         if self.mode == "move":
+             raise StepperError("%s: a move is in progress" % self.name)
+@@ -805,6 +821,20 @@
+         return False
+ 
+ 
++def _get_funcsel(gpio):
++    """Read a pad's current function select. None if it cannot be read.
++
++    5 == SIO, 6 == PIO0, 7 == PIO1 (the constants above). This exists so the
++    `pads` diagnostic can answer, in one command, "is the velocity state
++    machine actually connected to the STEP pin?" -- the question that cost an
++    evening when an axis counted steps it was not emitting.
++    """
++    try:
++        return machine.mem32[_IO_BANK0 + 0x04 + 8 * gpio] & 0x1F
++    except Exception:
++        return None
++
++
+ def _clear_fifos(sm_id):
+     """Equivalent of the SDK's pio_sm_clear_fifos(): toggle FJOIN_RX twice."""
+     try:
+@@ -905,6 +935,20 @@
+     if not (axis_a.enabled and axis_b.enabled):
+         raise StepperError("both motors must be enabled for a coordinated move")
+ 
++    # THE GUARD move() AND single_step() BOTH HAVE AND THIS DID NOT.
++    #
++    # Two step generators share one STEP pin per axis. Running a coordinated
++    # move while an axis is in velocity mode has both writing the same pad,
++    # and -- worse -- the finally clause below calls _release_step_pin() on
++    # both axes, handing the pad to SIO while the velocity SM is still
++    # active and still being fed periods. The axis then counts steps it
++    # never emits until the next reboot.
++    for ax in (axis_a, axis_b):
++        if ax.mode == "vel":
++            raise StepperError(
++                "%s is in velocity mode -- 'velmode off' before moving"
++                % ax.name)
++
+     na, nb = int(steps_a), int(steps_b)
+     fwd_a, fwd_b = na > 0, nb > 0
+     aa, ab = abs(na), abs(nb)
+@@ -1050,6 +1094,10 @@
+         self.trips = 0
+         self._limited = False
+         self._pitch_sum_limit = 0
++        #: Step-sum reading at the last start(), so the pitch clamp's frame is
++        #: centred on the pose tracking STARTED from rather than on whatever
++        #: `position` homing happened to leave behind. See start().
++        self._tot0 = 0
+         self.shifts = 0
+         self._shift_pending = 0
+         self._shift_deferred_out = 0
+@@ -1062,6 +1110,20 @@
+         self._b.enter_vel_mode()
+         self._last_cmd_ms = time.ticks_ms()
+         self._tripped = False
++        # `limited` is a latch so a host that polls slowly still sees that the
++        # clamp fired. Clear it HERE so it means "during this tracking run"
++        # rather than "at some point since the board booted" -- otherwise the
++        # first run that clamps makes every later run report limited.
++        self._limited = False
++        # CENTRE THE CLAMP ON THE POSE WE ARE STARTING FROM.
++        #
++        # _arm_pitch_limit's docstring says the frame is centred on the placed
++        # pose, but _tick compared the RAW sum, and vel_position is
++        # `position + _pos_micro // 1e6` -- `position` being the position-mode
++        # counter left over from homing, which enter_vel_mode does not reset
++        # (it resets only _pos_micro). Taking the reading here makes the frame
++        # mean what it claims.
++        self._tot0 = self._a.vel_position + self._b.vel_position
+         self._arm_pitch_limit()
+         self.timer = Timer()
+         self.timer.init(period=config.VEL_TICK_MS,
+@@ -1235,15 +1297,31 @@
+         # back off the stop.
+         lim = self._pitch_sum_limit
+         if lim:
+-            tot = self._a.vel_position + self._b.vel_position
++            tot = (self._a.vel_position + self._b.vel_position) - self._tot0
+             if tot > lim or tot < -lim:
+                 ta = self._a.target_rate
+                 tb = self._b.target_rate
+                 push = ta + tb
+                 if (tot > 0 and push > 0) or (tot < 0 and push < 0):
+-                    half = (ta - tb) // 2
+-                    self._a.target_rate = half
+-                    self._b.target_rate = -half
++                    # STOP, do not steer.
++                    #
++                    # This used to keep (ta - tb) // 2 and call it "the yaw
++                    # component". When the demand is nearly PURE PITCH that
++                    # residual is noise, and executing it is a yaw slew
++                    # nobody asked for. Measured on run_2026-09-20_132627:
++                    # the loop asked for (-319, -514) and the clamp executed
++                    # (+97, -97) -- 4.75 deg/s of yaw -- which moved the
++                    # drone's box 270 px AWAY from the goal and took the
++                    # pixel error from 145 to 360. It reads exactly like a
++                    # motor running backwards, and it is not.
++                    #
++                    # Zeroing both is the only response that cannot move the
++                    # payload in a direction the control law never asked
++                    # for. Coming back off the stop still works: the next
++                    # command whose push has the opposite sign fails the
++                    # test above and passes through untouched.
++                    self._a.target_rate = 0
++                    self._b.target_rate = 0
+                     self._limited = True
+         dt = self._dt_us
+         self._a.vel_tick(dt)
+--- firmware/current/cli.py
++++ firmware/current/cli.py
+@@ -110,6 +110,9 @@
+   pins                     full pin map, with the known board findings
+   status                   axis state, position, fault line
+   state                    same, as one line of JSON (used by the GUI)
++  pads                     who owns each STEP pad (SIO/PIO0/PIO1) vs mode.
++                           An axis in `vel` whose pad reads SIO counts steps
++                           it never emits -- that is the fault to look for.
+   cfg                      current configuration
+   findings                 the hardware findings, short form
+   wiring                   coil connector pinouts -- read this if a motor
+@@ -336,6 +339,8 @@
+             self.show_status()
+         elif cmd == "state":
+             self.emit_state()
++        elif cmd == "pads":
++            self.show_pads()
+ 
+         # -------- differential (payload axes) --------
+         elif cmd == "diff":
+@@ -1184,6 +1189,26 @@
+             print("%s is %s (GPIO%d)"
+                   % (which, "ON" if out.is_on() else "off", out.gpio))
+ 
++    def show_pads(self):
++        """Who owns each STEP pad right now: SIO, PIO0 or PIO1.
++
++        The question this answers is "is the velocity state machine actually
++        connected to the STEP pin?". An axis whose mode is `vel` but whose pad
++        reads SIO counts every step it is asked for and emits none of them --
++        silently, until reboot. One line per axis; `MISMATCH` is the fault.
++        """
++        names = {5: "SIO", 6: "PIO0", 7: "PIO1"}
++        print("PADS")
++        for name, ax in sorted(self.axes.items()):
++            gpio = ax.spec["step"]
++            fs = stepper._get_funcsel(gpio)
++            want = 6 if (ax.vel_sm_id if ax.mode == "vel" else ax.sm_id) < 4 \
++                else 7
++            owner = names.get(fs, "?%s" % fs)
++            ok = "ok" if (ax.mode != "vel" or fs == want) else "MISMATCH"
++            print("  %-5s STEP=GPIO%-2d mode=%-5s funcsel=%-4s expect=%-4s %s"
++                  % (name, gpio, ax.mode, owner, names.get(want, "?"), ok))
++
+     def emit_state(self):
+         """
+         One line of JSON describing everything, for the desktop GUI.
+@@ -1223,6 +1248,13 @@
+         vel = {
+             "running": self.velocity.running,
+             "tripped": self.velocity.tripped,
++            # THE CLAMP IS OTHERWISE SILENT. The property has existed since the
++            # pitch limit was written but was never serialised, so a host
++            # watching STATE could not tell "the firmware is refusing my pitch
++            # command" from "a motor is dead" -- which is exactly the hour
++            # run_2026-09-20_132627 cost. Latched within a run; cleared by
++            # VelocityLoop.start().
++            "limited": self.velocity.limited,
+             "age_ms": self.velocity.age_ms(),
+             "ticks": self.velocity.ticks,
+             "trips": self.velocity.trips,

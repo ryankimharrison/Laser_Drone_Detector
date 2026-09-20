@@ -1,0 +1,25 @@
+--- firmware/current/stepper.py
++++ firmware/current/stepper.py
+@@ -1167,6 +1167,22 @@
+             self.timer = None
+         self._a.leave_vel_mode()
+         self._b.leave_vel_mode()
++        # CLEAR THE LATCH WITH THE SESSION IT DESCRIBES.
++        #
++        # `_tripped` means "the watchdog fired during this velocity session".
++        # start() clears it, command() clears it, and stop() did not -- so it
++        # outlived the session and reported on one that had ended. Since the
++        # host stops sending `vel` at shutdown, the watchdog fires by design on
++        # EVERY run, and the flag was therefore set on every subsequent `state`
++        # until the board was power-cycled. The host's homing check reads it
++        # and refuses: three runs lost on 2026-09-20 (142026, 142809, 142953),
++        # each cleared by hand with `velmode on` / `velmode off` -- which works
++        # only because start() resets the flag.
++        #
++        # `trips` is NOT touched. That counter is cumulative and is the actual
++        # diagnostic record; the latch is a per-session flag and now has a
++        # per-session lifetime.
++        self._tripped = False
+ 
+     @property
+     def running(self):

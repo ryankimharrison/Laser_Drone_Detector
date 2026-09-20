@@ -1,0 +1,230 @@
+--- turret_host/tracker.py
++++ turret_host/tracker.py
+@@ -167,6 +167,11 @@
+         #: detection vanished, and the only trace was n_targets disagreeing
+         #: with has_box, which gives a count and no distances.
+         self.last_rejected_px: List[float] = []
++        #: Detections discarded this frame for being too wide to be the drone.
++        #: Counted rather than folded into last_rejected_px, because telemetry
++        #: writes that list as bare distances and an analysis expecting numbers
++        #: should keep getting numbers.
++        self.last_shape_dropped = 0
+         #: How many times the track was restarted from a detection rather than
+         #: corrected toward one. A climbing count during a run means the motion
+         #: model is repeatedly ending up somewhere the target is not, which is
+@@ -197,6 +202,14 @@
+         #: width is a LOWER BOUND on the object and cannot be ranged from.
+         self._stable_at_edge: bool = False
+         self._last_det: Optional[Detection] = None     # raw, for the GUI
++        #: The last ASSOCIATED detection and the time it was measured, kept
++        #: across misses so the interlock can still see it while it is fresh.
++        #: Deliberately separate from `_last_det`, which stays exactly as it
++        #: was: `_last_det` is what the association step writes every frame,
++        #: and conflating "what happened this frame" with "the most recent
++        #: measurement" is how a held value silently becomes a live one.
++        self._held_det: Optional[Detection] = None
++        self._held_det_t: Optional[float] = None
+ 
+     # ----------------------------------------------------------------- public
+ 
+@@ -242,6 +255,21 @@
+     # ---------------------------------------------------------------- filter
+ 
+     def _update(self, dets: List[Detection], t: float) -> TrackEstimate:
++        # SHAPE FILTER, AT THE ONE PLACE EVERY PATH GOES THROUGH.
++        #
++        # A box much wider than tall is the hand holding the drone, not the
++        # drone -- see config.ASSOC_BOX_ASPECT_MAX. Dropping it HERE rather
++        # than inside _associate() is deliberate and was found by testing: the
++        # gate is not the only way a detection becomes the track. _update has
++        # three seed paths that bypass _associate entirely -- the first frame
++        # ever, the SEARCH re-entry, and the RESEED_AFTER_MISSES branch -- and
++        # every one of them takes max(dets, key=conf) directly. Filtering only
++        # in the gate left the reseed path free to adopt a hand-shaped box,
++        # which is exactly what it did on the recorded hand approach.
++        dropped = [d for d in dets if not self._shape_ok(d)]
++        if dropped:
++            dets = [d for d in dets if self._shape_ok(d)]
++        self.last_shape_dropped = len(dropped)
+         if self._t is None:
+             # Very first frame ever. Nothing to predict against, so no gate.
+             self._t = t
+@@ -352,6 +380,8 @@
+             a = _I4 - k @ _H
+             self._P = a @ p_pred @ a.T + k @ _R @ k.T
+             self._last_det = match
++            self._held_det = match
++            self._held_det_t = t
+ 
+         # Every frame, hit or miss.
+         self.q = config.Q_BASE + config.Q_DECAY * (self.q - config.Q_BASE)
+@@ -390,6 +420,23 @@
+         if decayed >= config.COAST_DECAY_MS:
+             return 0.0
+         return 1.0 - decayed / config.COAST_DECAY_MS
++
++    @staticmethod
++    def _shape_ok(d: Detection) -> bool:
++        """Is this box drone-shaped enough to be used as a measurement?
++
++        ONE-SIDED ON PURPOSE. The hand signature is WIDE: 1.67-2.22 over the
++        17 associated boxes of the recorded hand approach. The drone held
++        edge-on or folded is TALL AND NARROW -- 0.39-0.48 on 17 frames across
++        both runs, and the frames show the real airframe every time. A
++        symmetric window would throw those away and lose the track, which is
++        the failure this is meant to reduce. Refusing to FIRE on an odd box is
++        free; refusing to TRACK one is not.
++        """
++        h = float(d.y2) - float(d.y1)
++        if h <= 0.0:
++            return False
++        return (float(d.x2) - float(d.x1)) / h <= config.ASSOC_BOX_ASPECT_MAX
+ 
+     def _associate(self, dets: List[Detection], x_pred: np.ndarray,
+                    p_pred: Optional[np.ndarray] = None
+@@ -454,6 +501,16 @@
+             ok = d2 <= floor2
+             if not ok and d2 <= ceil2 and s_inv is not None:
+                 ok = float(nu @ s_inv @ nu) <= config.GATE_CHI2
++            # A LONE CONFIDENT DETECTION OUTRUNS THE PREDICTION, NOT THE GATE.
++            # With one box in frame there is nothing to mistake it for, so a
++            # large innovation says the PREDICTION is stale -- which is what a
++            # hand-carried drone does to a constant-velocity model. In
++            # run_2026-09-20_144709, 21 of 26 TRACK losses were the real drone
++            # at conf 0.54-0.81, a median 241 px away. Shape-filtered upstream
++            # and still capped by GATE_MAX_PX.
++            if (not ok and len(dets) == 1 and d2 <= config.ASSOC_LONE_PX ** 2
++                    and float(d.conf) >= config.ASSOC_LONE_CONF):
++                ok = True
+             if ok and d2 < best_d2:
+                 if best is not None:
+                     rejected.append(math.sqrt(best_d2))
+@@ -613,6 +670,9 @@
+         self._hold = None
+         self._prev_box = None
+         self._last_det = None
++        # A track that has been given up on has no measurement to offer.
++        self._held_det = None
++        self._held_det_t = None
+         self._coast_t0 = None
+         self._coast_v0 = None
+ 
+@@ -664,6 +724,22 @@
+         else:
+             x, _ = self._propagate(self._x, self._P, t - self._t, t)
+ 
++        # WHICH BOX THE INTERLOCK IS ALLOWED TO SEE.
++        #
++        # On a frame that associated, this is that detection. On a frame that
++        # did not, it is the last associated one for up to FIRE_BOX_HOLD_S --
++        # carrying its ORIGINAL measurement time, so nothing downstream is
++        # misled about how old it is.
++        #
++        # SEARCH never offers a held box: the track has been given up on, and
++        # a firing permission must not outlive the track it belonged to.
++        box, box_t = self._last_det, (None if self._last_det is None else self._t)
++        if (box is None and self.state is not TrackState.SEARCH
++                and self._held_det is not None and self._held_det_t is not None):
++            age = t - self._held_det_t
++            if 0.0 <= age <= config.FIRE_BOX_HOLD_S:
++                box, box_t = self._held_det, self._held_det_t
++
+         bias = self._aim_bias()
+         range_m, range_source = self._range()
+         return TrackEstimate(
+@@ -676,11 +752,12 @@
+             q=self.q,
+             nis=self.nis,
+             occluded=self._hold is not None,
+-            box=self._last_det,
+-            # `_last_det` is cleared to None on any frame that fails to
+-            # associate, so when it is set it is always from the most recent
+-            # update, at self._t. The interlock gates the beam on this age.
+-            box_t=None if self._last_det is None else self._t,
++            box=box,
++            # The time the box was MEASURED, never the time it is being read.
++            # On a hit that is self._t; on a held box it is when the hold
++            # started, so the interlock's DRONE_BOX_MAX_AGE_S test keeps
++            # working on the real age and a held box expires on schedule.
++            box_t=box_t,
+             range_m=range_m,
+             range_source=range_source,
+         )
+--- turret_host/config.py
++++ turret_host/config.py
+@@ -864,6 +864,75 @@
+ # 30 fps this is ~4 frames, enough to ride out a dropped frame without letting a
+ # tracker coast the beam across a room on a stale measurement.
+ DRONE_BOX_MAX_AGE_S = 0.150
++
++#: How long the tracker keeps offering the last ASSOCIATED detection to the
++#: interlock after a frame that failed to associate. 0.0 restores the old
++#: behaviour (the box is dropped on the first miss).
++#:
++#: WHY IT EXISTS. 32 of the 62 raw firing bursts in run_2026-09-20_145109 ended
++#: on `drone_lock` alone -- one detector miss, beam off, beam on again a frame
++#: later. The detection was good, the drone had not moved, and nothing about
++#: the permission had actually changed; only the detector blinked.
++#:
++#: WHY IT IS SAFE. The held box carries its ORIGINAL box_t, so
++#: DRONE_BOX_MAX_AGE_S still rejects it by age and the containment test still
++#: runs against the CURRENT aim point every frame. A drone that moves away from
++#: the beam loses containment on the next frame exactly as before. This extends
++#: how long a measurement stays usable; it does not make a stale measurement
++#: count as a fresh one.
++#:
++#: 0.100 is three frames at 30 fps, and is bounded by DRONE_BOX_MAX_AGE_S
++#: (0.150) regardless.
++#:
++#: MEASURED, AND IT IS A REGRESSION ON ITS OWN. Replay of 145109 (see
++#: tools/replay_gates.py): raw bursts 62 -> 40, which is the fragmentation this
++#: is meant to fix -- but FIRING rows 638 -> 567 and beam time 21.0 -> 18.7 s,
++#: because the longer continuous bursts reach LASER_MAX_ON_MS (2000) sooner and
++#: each cap costs a LASER_COOLDOWN_S rest. Duty trips go 1 -> 3 and rows lost to
++#: cool-down 52 -> 159. With the duty cap relaxed to 5000/500 ms the same hold
++#: gives 729 rows and 24.0 s. SO: DO NOT SHIP THIS WITHOUT THE DUTY CHANGE.
++FIRE_BOX_HOLD_S = 0.100
++
++# --------------------------------------------------------------------------
++#   ASSOCIATION-TIME SHAPE AND LONE-DETECTION RULES  (item 4)
++# --------------------------------------------------------------------------
++#: Reject a detection as a MEASUREMENT when it is this much wider than tall.
++#:
++#: THE HAND SIGNATURE IS SPECIFICALLY WIDE, AND ONLY WIDE. On
++#: run_2026-09-20_145109 the turret converged on hand-shaped boxes for 1.07 s
++#: (f006805-f006835, 17 associated boxes, aspect 1.67-2.22) before firing on
++#: the carrier's knuckles. Blocking those at the INTERLOCK stops the beam;
++#: blocking them HERE stops the aim point being dragged onto the hand in the
++#: first place, which is the thing that made a coincidence of gates dangerous.
++#:
++#: DELIBERATELY ASYMMETRIC, AND THIS IS THE WHOLE POINT. There is no low bound.
++#: The drone held edge-on or folded produces a TALL NARROW box -- measured at
++#: aspect 0.39-0.48 on 17 frames across both runs, and the frames show the real
++#: airframe every time (145109 f004546, f004638, f005092; 144709 f002569,
++#: f003527). Applying FIRE_BOX_ASPECT_MIN (0.45) here would throw those away
++#: and lose the track, which is exactly the failure item 4 exists to reduce.
++#: The firing gate may be symmetric because refusing to fire is free; refusing
++#: to ASSOCIATE is not.
++#:
++#: Cost, measured across both runs: of the 55 accepted boxes outside the firing
++#: window, this rule rejects the 27 wide ones (25 of them the hand cluster) and
++#: keeps all 28 narrow ones.
++ASSOC_BOX_ASPECT_MAX = 1.6
++
++#: A lone confident detection this far from the prediction is accepted even
++#: though the covariance gate refused it.
++#:
++#: In run_2026-09-20_144709, 21 of 26 TRACK losses were the real drone --
++#: conf 0.54-0.81, median 241 px from the prediction -- discarded because the
++#: carrier moved faster than the filter expected. With one detection in frame
++#: and nothing else to confuse it with, "far from where I predicted" is
++#: evidence the PREDICTION is wrong, not that the detection is.
++#:
++#: Guarded three ways: only when it is the ONLY detection in the frame, only
++#: above ASSOC_LONE_CONF, and only when the box is drone-shaped by the rule
++#: above. GATE_MAX_PX (300) still caps everything.
++ASSOC_LONE_PX = 250.0
++ASSOC_LONE_CONF = 0.5
+ # Shrink the box per side before testing containment, as a fraction of its own
+ # width/height so it scales with range. The 283 mm airframe is ~132 px at 3 m,
+ # so 0.15 leaves ~92 px of permitted region there -- the body, not the rim,

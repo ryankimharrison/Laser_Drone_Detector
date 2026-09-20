@@ -1,0 +1,603 @@
+--- turret_host/link.py
++++ turret_host/link.py
+@@ -89,7 +89,19 @@
+     "imu mag": (6.0, 0.5),
+     "state": (6.0, 0.5),
+     "stop": (6.0, 0.5),
++    # `velmode off` moves nothing: a timer deinit, two 2 ms sleeps and a
++    # print. It is NOT in the settle=timeout group above for that reason. It
++    # had no entry at all, so it inherited _DEFAULT_BLOCKING_TIMEOUT's 10 s on
++    # a shutdown path that now sends it deliberately.
++    "velmode": (3.0, 0.3),
+ }
++
++#: How long a live console may take to ECHO a command back before we call the
++#: board silent -- the ONLY bound on a board that never answers, since the
++#: settle gap requires bytes to have arrived. See `_read_reply`. Generous
++#: against USB CDC scheduling and a GC pause on the board (worst measured
++#: 1.7 ms).
++_FIRST_BYTE_S = 2.0
+ _DEFAULT_BLOCKING_TIMEOUT = (10.0, 1.0)
+ 
+ # The vel round trip is "ok\r\nturret> " and nothing else. If it has not come
+@@ -187,14 +199,39 @@
+     return None
+ 
+ 
+-def _read_reply(ser, timeout, settle):
++def _read_reply(ser, timeout, settle, first_byte=_FIRST_BYTE_S):
+     """Read until the prompt returns, or until the board goes quiet.
+ 
+     Returns (text, saw_prompt). The echoed command line is still in `text`;
+     the caller strips it because only the caller knows what it sent.
++
++    TWO DIFFERENT SILENCES, AND ONLY ONE OF THEM IS THE SETTLE GAP'S BUSINESS.
++
++    The settle gap below handles "the board said something and then went
++    quiet". It requires bytes to have arrived (`elif buf`), which is correct:
++    a motion command echoes and then prints NOTHING for as long as the
++    platform moves, so the settle for those commands is the full timeout --
++    see _BLOCKING_TIMEOUTS, where getting that wrong cost three runs on
++    2026-09-20.
++
++    `first_byte` handles the other silence: not one byte, ever. The settle gap
++    has never applied to that case, so it ran the FULL timeout -- 60 s for
++    `move`, 240 s for `level`, on a shutdown path that runs on the Tk main
++    thread. A live console ECHOES the command line back before it does any
++    work (this module already depends on that: `_transact` strips the echo off
++    the front of every reply), so "not one byte in `first_byte` seconds" is
++    not slow work, it is a console that is not reading its input, and waiting
++    out the remaining 58 s cannot change that answer.
++
++    The deadline applies ONLY while the buffer is still empty, so nothing that
++    reaches the board is affected: the echo clears it within milliseconds and
++    the settle rules take over untouched.
+     """
+     buf = bytearray()
+-    deadline = time.monotonic() + timeout
++    start = time.monotonic()
++    deadline = start + timeout
++    quiet_deadline = (start + min(first_byte, timeout) if first_byte
++                      else deadline)
+     last = time.monotonic()
+     saw_prompt = False
+     while time.monotonic() < deadline:
+@@ -210,7 +247,11 @@
+             if buf.rstrip().endswith(PROMPT):
+                 saw_prompt = True
+                 break
+-        elif buf and time.monotonic() - last > settle:
++        elif buf:
++            if time.monotonic() - last > settle:
++                break
++        elif time.monotonic() > quiet_deadline:
++            # Never heard from at all. Stop now and let command() say so.
+             break
+     text = buf.decode("utf-8", "replace")
+     lines = [ln for ln in text.splitlines() if ln.strip() != PROMPT.decode()]
+@@ -417,6 +458,14 @@
+         # on the way out the door.
+         self._motors_live = False
+         self._vel_mode_entered = False
++
++        #: What _read_reply had collected when it gave up without seeing a
++        #: prompt. "nothing came back at all" and "a reply came back but no
++        #: prompt followed" are DIFFERENT faults with different causes, and
++        #: command() reported both as "no reply within the timeout" -- which
++        #: is what hid the settle-gap bug behind a message that pointed at the
++        #: board. With this, the echo that HAD arrived is in the error text.
++        self._last_partial = ""
+ 
+         # Laser state, driven from the writer thread -- see set_laser().
+         # _want is what the interlock asked for; _is is what the board was
+@@ -1351,7 +1400,11 @@
+         if cmd and text.startswith(cmd):
+             text = text[len(cmd):].strip()     # drop the console's echo
+         if not saw_prompt:
++            # Keep whatever DID arrive so the caller can say which failure
++            # this was. See _last_partial in __init__.
++            self._last_partial = text
+             return None
++        self._last_partial = ""
+         return text
+ 
+     # ------------------------------------------------------------------
+@@ -1475,7 +1528,27 @@
+                                settle=settle if settle is not None
+                                else default[1])
+         if reply is None:
+-            raise LinkError("no reply to %r within the timeout" % cmd)
++            # SAY WHICH FAILURE THIS WAS. A silent board and a board that
++            # answered without a prompt need different things looked at, and
++            # reporting both the same way is what sent a session hunting a
++            # reply parser that was working correctly -- while the actual
++            # fault was a settle window shorter than the move.
++            partial = self._last_partial or ""
++            if partial:
++                raise LinkError(
++                    "no prompt after %r within the timeout; %d bytes did "
++                    "arrive, first line: %s. If those bytes are just the "
++                    "echo, the command was still running when the read gave "
++                    "up -- check this command's settle in _BLOCKING_TIMEOUTS "
++                    "against how long the platform actually moves for."
++                    % (cmd, len(partial), partial.splitlines()[0][:160]))
++            raise LinkError(
++                "no reply at all to %r -- the board did not echo one byte in "
++                "%.1f s. A live console echoes before it does any work, so "
++                "this is not slow work: the console is not reading its input "
++                "(it exited, or the raw REPL has the port). Check with "
++                "`python tools/send.py state`; if that is silent too the "
++                "console needs restarting." % (cmd, _FIRST_BYTE_S))
+         low = reply.lower()
+         if low.startswith("usage error") or low.startswith("error:") \
+                 or "unknown command" in low:
+--- turret_host/step_integrity.py
++++ turret_host/step_integrity.py
+@@ -132,6 +132,28 @@
+         return {k: int(ax[k]["position"]) for k in ("pan", "tilt")}
+     except Exception:                                   # noqa: BLE001
+         return None
++
++
++def _vel_axes(link):
++    """Axis names the board still reports in velocity mode, or None.
++
++    None means NO ANSWER -- the same distinction `_read_tilt` makes, and for
++    the same reason: "the board did not say" must never be read as "the board
++    said no".
++    """
++    try:
++        st = link.state()
++    except Exception:                                      # noqa: BLE001
++        return None
++    axes = st.get("axes") or {}
++    if not axes:
++        return None
++    bad = [n for n, ax in axes.items() if ax.get("mode") == "vel"]
++    if (st.get("velocity") or {}).get("running") and not bad:
++        # The 200 Hz timer is live even though neither axis admits to it.
++        # Still not a state to command a `move` from.
++        bad = ["velocity timer"]
++    return bad
+ 
+ 
+ def capture(link, level_ok: Optional[bool] = None) -> Optional[dict]:
+@@ -180,12 +202,58 @@
+     # link.py: leaving velocity mode FOLDS the dead-reckoning accumulator back
+     # into the integer step counter, so doing it before the rewind is what
+     # makes the counter self-consistent for the residual reported below.
++    # DO NOT SWALLOW THIS FAILURE.
++    #
++    # It used to be `except Exception: pass`, on the reasoning that the moves
++    # below would report their own failure. They do not report it usefully:
++    # they come back as "no reply ... within the timeout" with nothing about
++    # velocity mode, and the report says nothing at all about why the rewind
++    # did not happen. Measured on run_2026-09-20_142026.
++    #
++    # There is a concrete way for this call to fail here: link.command() goes
++    # through _require_idle(), which raises LinkBusy while _servo_active is
++    # still set -- and on the GUI shutdown path it can still be set at this
++    # point. link.stop() is what clears it, so that is the retry.
++    velmode_note = None
+     try:
+         link.command("velmode off", timeout=3.0)
+-    except Exception:                                      # noqa: BLE001
+-        # Already off, or the board is gone. Either way the moves below will
+-        # report their own failure; never lose the check to this.
+-        pass
++    except Exception as exc:                               # noqa: BLE001
++        velmode_note = "velmode off refused (%s)" % exc
++        try:
++            link.stop()
++            link.command("velmode off", timeout=3.0)
++            velmode_note += "; recovered after link.stop()"
++        except Exception as exc2:                          # noqa: BLE001
++            # Still in velocity mode. The firmware will refuse every move
++            # below, so running them would only produce a misleading
++            # "residual". Skip the rewind and SAY SO -- a check that silently
++            # did not run is worse than one that reports it could not.
++            return {"error": "could not leave velocity mode, rewind SKIPPED "
++                             "-- %s; retry after stop() also failed (%s)"
++                             % (velmode_note, exc2),
++                    "delta": delta, "moved": False}
++
++    # ASK THE BOARD, DO NOT ASSUME. `velmode off` returning a prompt says the
++    # command was accepted; it does not say both axes left velocity mode, and
++    # this function is about to issue a `move`, which is the one command that
++    # must not be sent in that state -- two step generators on one STEP pad
++    # produce a garbled pulse train that loses steps silently, which is the
++    # exact fault this whole module exists to detect. Reading it back costs one
++    # `state` round trip on a path that is already seconds long.
++    still_vel = _vel_axes(link)
++    if still_vel is None:
++        return {"error": "could not read `state` to confirm the axes left "
++                         "velocity mode; rewind SKIPPED rather than issue a "
++                         "`move` into an unknown mode",
++                "delta": delta, "moved": False,
++                "velmode_note": velmode_note}
++    if still_vel:
++        return {"error": "still in velocity mode after `velmode off` (%s); "
++                         "rewind SKIPPED -- a move sharing the STEP pad with "
++                         "the velocity state machine loses steps silently"
++                         % ", ".join(sorted(still_vel)),
++                "delta": delta, "moved": False,
++                "velmode_note": velmode_note}
+ 
+     for k in ("pan", "tilt"):
+         if delta[k] == 0:
+@@ -200,6 +268,12 @@
+     rep = {"delta": delta, "moved": True,
+            "counter_residual": {k: (_positions(link) or p1)[k] - p0[k]
+                                 for k in p0}}
++    if velmode_note:
++        # The rewind DID run, but not on the first ask. Worth recording: it
++        # means the caller handed this function a link that still thought it
++        # was servoing, which is a bug in the shutdown ordering even though
++        # the check recovered from it.
++        rep["velmode_note"] = velmode_note
+ 
+     t0, t2 = datum.get("tilt"), _read_tilt(link)
+     rep["level_ok"] = datum.get("level_ok")
+@@ -239,6 +313,9 @@
+     d = rep["delta"]
+     out = ["step check: rewound pan %+d, tilt %+d microsteps to the datum"
+            % (-d["pan"], -d["tilt"])]
++    if rep.get("velmode_note"):
++        out.append("  NOTE %s -- the caller left velocity mode on; the "
++                   "rewind ran only after a retry" % rep["velmode_note"])
+     res = rep.get("counter_residual") or {}
+     if any(res.values()):
+         out.append("  COUNTER residual %+d/%+d -- the rewind itself was short, "
+--- turret_host/app.py
++++ turret_host/app.py
+@@ -174,7 +174,32 @@
+ # 60 deg against a 90 deg mechanical stop. The sampler runs at ~10 Hz, so a
+ # reading can be 100 ms old, and full-rate payload pitch is 195 deg/s = 19.5
+ # deg in that time. 30 deg of margin covers it with room to spare.
+-ATTITUDE_MAX_DEG = 85.0   # 2026-09-20 operator: 60 -> 85 (mechanical stop is +/-90 from level; the skip-level datum can be several deg off)
++ATTITUDE_MAX_DEG = 85.0   # 2026-09-20 operator: 60 -> 85 (mechanical stop is +/-90 from level)
++
++# ...AND IT IS NOW MEASURED FROM TRUE VERTICAL, NOT FROM THE DATUM.
++#
++# THE 85 IS ONLY SAFE BECAUSE OF THIS. The operator raised 60 -> 85 with the
++# reason "the skip-level datum can be several deg off" -- but while the angle
++# was measured FROM THAT DATUM, being several degrees off is exactly what
++# spends the margin. On run_2026-09-20_142953 the datum sat ~8 deg from
++# vertical, so 85 deg from the datum is up to 93 deg from vertical: PAST the
++# +/-90 mechanical stop, on the side the datum leans towards. Raising the
++# number and keeping the datum reference moves the trip from "too early on one
++# side" to "too late on one side", and too late is the one that hits metal.
++#
++# The stop is at 90 deg from VERTICAL. That is what the margin is margin
++# against, so vertical is what the angle has to be measured from. Gravity gives
++# it directly and needs no datum: the reference is _gravity_unit(0, 0).
++# With this, 85 means 5 deg of margin wherever the datum happened to be.
++#
++# Still axis-agnostic, which is the property the paragraph above protects --
++# the angle between two vectors needs no yaw and no axis assignment. And it
++# repairs the dead-reckoning cross-check further down for free: that one argues
++# gravity's total angle "bounds |true pitch| from BELOW", which is true of tilt
++# from vertical and is NOT true of tilt from an arbitrary datum.
++#
++# ATTITUDE_MAX_DEG itself is untouched. It is the operator's number.
++TILT_VERTICAL = (0.0, 0.0, 1.0)
+ # 2026-09-20 operator: on an envelope trip, do not freeze -- REVERSE the last
+ # ATTITUDE_REVERSE_S of commanded motion (direction-preserving, at least
+ # ATTITUDE_REVERSE_MIN_RATE on the faster motor, at most 600 steps/s) until gravity
+@@ -622,6 +647,9 @@
+         # Unit gravity vector at the datum, captured when homing completes.
+         # None until then -- the guard is inert without a reference.
+         self._tilt_datum = None
++        #: Degrees between the homing datum and true vertical. Envelope spent
++        #: before the run starts; see TILT_VERTICAL.
++        self._datum_tilt_from_vertical = 0.0
+         self._attitude_tripped = False
+         self._cmd_hist: collections.deque = collections.deque(maxlen=120)   # (t, rate_a, rate_b) sent
+         self._reverse_rates = (0.0, 0.0)
+@@ -1387,14 +1415,12 @@
+             return 0.0
+         return math.degrees(math.acos(max(-1.0, min(1.0, dot / (na * nb)))))
+ 
+-    def tilt_from_datum(self, now: float):
+-        """(degrees, age_s) from the datum attitude, or None if no fresh read.
++    def _fresh_gravity(self, now: float):
++        """(unit gravity, age_s) from a sample no older than the limit, or None.
+ 
+         None means "no measurement", NEVER "level" -- the caller falls back to
+         the dead-reckoned guard rather than assuming anything.
+         """
+-        if self._tilt_datum is None:
+-            return None
+         item, _seq = self.attitude_slot.get()
+         if item is None:
+             return None
+@@ -1402,28 +1428,37 @@
+         age = now - t
+         if not 0.0 <= age <= ATTITUDE_MAX_AGE_S:
+             return None
+-        return (self._angle_between(self._gravity_unit(pitch, roll),
+-                                    self._tilt_datum), age)
++        return (self._gravity_unit(pitch, roll), age)
+ 
+     def tilt_from_vertical(self, now: float):
+         """(degrees from TRUE VERTICAL, age_s), or None if no fresh read.
+ 
+-        2026-09-20: the envelope is checked against this, not the datum. The
+-        mechanical stop is +/-90 from LEVEL; a skip-level datum that is 8 deg
+-        off would let a datum-relative 85 reach 93 on one side. Still gated on
+-        `_tilt_datum` so the guard stays inert if the IMU never answered.
++        This is what the envelope is checked against -- see TILT_VERTICAL.
++
++        `_tilt_datum` still gates it, and deliberately: it is the record that
++        the IMU answered at all at homing time. If it never did, the guard
++        stays INERT exactly as it did before, and the operator was told so.
+         """
+         if self._tilt_datum is None:
+             return None
+-        item, _seq = self.attitude_slot.get()
+-        if item is None:
++        g = self._fresh_gravity(now)
++        if g is None:
+             return None
+-        t, pitch, roll = item
+-        age = now - t
+-        if not 0.0 <= age <= ATTITUDE_MAX_AGE_S:
++        return (self._angle_between(g[0], TILT_VERTICAL), g[1])
++
++    def tilt_from_datum(self, now: float):
++        """(degrees from the datum attitude, age_s), or None.
++
++        No longer the envelope check -- kept because "how far has the payload
++        moved since homing" is still the right question for the logs, and the
++        two numbers differing by 8 deg is precisely what was invisible before.
++        """
++        if self._tilt_datum is None:
+             return None
+-        return (self._angle_between(self._gravity_unit(pitch, roll),
+-                                    (0.0, 0.0, 1.0)), age)
++        g = self._fresh_gravity(now)
++        if g is None:
++            return None
++        return (self._angle_between(g[0], self._tilt_datum), g[1])
+ 
+     def _capture_tilt_datum(self) -> None:
+         """Record the attitude homing just established as the reference."""
+@@ -1432,15 +1467,40 @@
+         reply = self.link.try_probe("imu fast", timeout=0.4, lock_wait=0.5)
+         m = _IMUF_RE.search(reply or "")
+         if not m:
++            self._datum_tilt_from_vertical = 0.0
+             self.log("attitude guard INERT: could not read a datum attitude. "
+                      "The travel limits fall back to the dead-reckoned pose, "
+                      "which measured 2.2x wrong on 2026-09-19.", "warn")
+             return
+         pitch, roll = float(m.group(4)), float(m.group(5))
+         self._tilt_datum = self._gravity_unit(pitch, roll)
+-        self.log("attitude guard armed at the datum (pitch %+.2f, roll %+.2f); "
+-                 "motion refused past %.0f deg from here, measured by gravity."
+-                 % (pitch, roll, ATTITUDE_MAX_DEG), "good")
++        # HOW MUCH ENVELOPE IS ACTUALLY LEFT, SAID OUT LOUD, AT READY.
++        #
++        # The datum is not always at zero, and when it is not, the operator is
++        # starting the run with less room than the limit implies -- on
++        # run_2026-09-20_142953 the payload was 8.02 deg down before tracking
++        # began. That was discoverable only by reading the IMU by hand.
++        off = self._angle_between(self._tilt_datum, TILT_VERTICAL)
++        self._datum_tilt_from_vertical = off
++        self.log("attitude guard armed: payload is %.2f deg from TRUE VERTICAL "
++                 "at the datum (pitch %+.2f, roll %+.2f). Motion is refused "
++                 "past %.0f deg from vertical, so there is %.1f deg of "
++                 "envelope left before the guard trips, in any direction."
++                 % (off, pitch, roll, ATTITUDE_MAX_DEG,
++                    ATTITUDE_MAX_DEG - off), "good")
++        # The margin between the envelope and the 90 deg mechanical stop is
++        # 90 - ATTITUDE_MAX_DEG, which at 85 is FIVE DEGREES. A datum offset
++        # bigger than that used to be bigger than the whole safety margin --
++        # and with the old datum-relative measurement it was spent silently.
++        # It no longer is, but the operator should still know.
++        margin = 90.0 - ATTITUDE_MAX_DEG
++        if off > margin:
++            self.log("NOTE: the datum is %.1f deg off vertical, which is more "
++                     "than the %.0f deg between the envelope (%.0f) and the 90 "
++                     "deg mechanical stop. The envelope is measured from "
++                     "vertical so this is no longer margin that vanishes, but "
++                     "levelling by hand and re-homing would still start the "
++                     "run centred." % (off, margin, ATTITUDE_MAX_DEG), "warn")
+ 
+     def _attitude_loop(self) -> None:
+         """Sample measured attitude while servoing, yielding to the vel stream.
+@@ -1723,13 +1783,19 @@
+                              "gravity reads under %.0f deg"
+                              % (ATTITUDE_REVERSE_S, ba, bb,
+                                 ATTITUDE_MAX_DEG - ATTITUDE_REVERSE_HYST_DEG), "warn")
++                    _fd = self.tilt_from_datum(now)
+                     self._fail_interlock(
+                         "ATTITUDE ENVELOPE: gravity says the payload is %.1f "
+-                        "deg from VERTICAL (limit %.0f, sample %.0f ms old). "
+-                        "The dead-reckoned pose says %.1f -- believe gravity. "
+-                        "Motion stopped before the mechanical stop."
++                        "deg from TRUE VERTICAL (limit %.0f, sample %.0f ms "
++                        "old; %.1f deg from the datum, which itself sat %.1f "
++                        "deg off vertical). The dead-reckoned pose says %.1f "
++                        "-- believe gravity. Motion stopped %.1f deg short of "
++                        "the mechanical stop."
+                         % (att[0], ATTITUDE_MAX_DEG, att[1] * 1000.0,
+-                           abs(self._pose[0]) if self._pose_valid else float("nan")),
++                           _fd[0] if _fd else float("nan"),
++                           self._datum_tilt_from_vertical,
++                           abs(self._pose[0]) if self._pose_valid else float("nan"),
++                           90.0 - att[0]),
+                         disarm=False)
+                 # Drive the reverse; the interlock keeps the beam off while
+                 # tripped, and tracking resumes once inside by the hysteresis.
+@@ -2496,6 +2562,68 @@
+         self.link.stop()
+         self._status_message = "safe state: %s" % why
+ 
++    def _leave_velocity_mode(self) -> None:
++        """`velmode off`, then read `state` back and say what it said.
++
++        Called from shutdown() before the step check. Separate from
++        link.close()'s own `velmode off` on purpose -- close() is the last-
++        resort park and runs after the step check, which is too late for a
++        `move` that needs move mode NOW.
++
++        Also clears the firmware watchdog latch for the NEXT run. `velmode on`
++        is what resets VelocityLoop._tripped (see stepper.py: stop() does not),
++        so a run that ends with the latch set makes the next homing refuse at
++        _confirm_idle with "the velocity watchdog is TRIPPED". The operator
++        cleared that by hand three times today. Homing now clears it itself as
++        well -- both, because either one alone leaves the other path broken.
++
++        Never raises: this is a shutdown step.
++        """
++        if self.link is None or self.sim:
++            return
++        try:
++            self.link.command("velmode off", timeout=3.0)
++        except Exception as exc:                           # noqa: BLE001
++            self.log("velmode off refused at shutdown (%s); retrying after "
++                     "stop()" % exc, "warn")
++            try:
++                self.link.stop()
++                self.link.command("velmode off", timeout=3.0)
++            except Exception as exc2:                      # noqa: BLE001
++                self.log("could not leave velocity mode at shutdown (%s). The "
++                         "step check will refuse to rewind, and the NEXT run "
++                         "will be refused at homing until `velmode on` then "
++                         "`velmode off` is sent by hand." % exc2, "error")
++                return
++        # Read it back. "The command was accepted" and "both axes are out of
++        # velocity mode" are different claims, and only the second one lets a
++        # `move` be issued safely.
++        try:
++            st = self.link.state()
++        except Exception as exc:                           # noqa: BLE001
++            self.log("velmode off sent, but `state` did not answer (%s) -- "
++                     "the mode is unconfirmed." % exc, "warn")
++            return
++        axes = st.get("axes") or {}
++        stuck = sorted(n for n, ax in axes.items() if ax.get("mode") == "vel")
++        vel = st.get("velocity") or {}
++        if stuck or vel.get("running"):
++            self.log("velmode off was accepted but the board still reports "
++                     "velocity mode (axes %s, timer running=%s). The step "
++                     "check will refuse to rewind."
++                     % (", ".join(stuck) or "none", vel.get("running")),
++                     "error")
++            return
++        if vel.get("tripped"):
++            # The latch survives velocity.stop() in the firmware, so say so
++            # plainly rather than let the next run discover it at homing.
++            self.log("note: the firmware velocity watchdog latch is still SET "
++                     "after velmode off (firmware stop() does not clear it). "
++                     "Homing clears it automatically; `velmode on` then "
++                     "`velmode off` clears it by hand.", "warn")
++        self.log("velocity mode left and confirmed idle (%d trips this run)."
++                 % int(vel.get("trips") or 0), "good")
++
+     def shutdown(self) -> None:
+         """Idempotent, and callable from any thread and any exception path."""
+         with self._shutdown_lock:
+@@ -2568,12 +2696,32 @@
+                 self.log("thread %s did not join in 2 s" % th.name, "warn")
+         self._threads = []
+ 
++        # 2a. LEAVE VELOCITY MODE, AND CONFIRM IT, BEFORE THE STEP CHECK.
++        #
++        #     The comment that used to sit below said "_safe_state() has left
++        #     velocity mode". IT HAS NOT, AND IT NEVER DID. _safe_state() calls
++        #     link.stop(), which zeroes the RATES; leaving the mode is owed by
++        #     link.close(), which is step 4, two steps further down. So the
++        #     step check has always run against a board still in velocity mode
++        #     and has been papering over it with a `velmode off` of its own.
++        #
++        #     That is not where it belongs. `velmode off` is part of parking
++        #     the machine, not part of measuring it, and doing it here means
++        #     the ONE place that knows the shutdown order is the place that
++        #     sets the order. Three runs on 2026-09-20 (142026, 142809, 142953)
++        #     ended with the board still in velocity mode, the watchdog latch
++        #     set, and the next app start refused at homing.
++        #
++        #     Bounded and never fatal: a shutdown step that can raise is one
++        #     that leaves motors enabled.
++        self._leave_velocity_mode()
++
+         # 2b. THE END-OF-RUN STEP CHECK. Placement is the whole trick:
+-        #     it must come AFTER the loop threads are joined and after
+-        #     _safe_state() has left velocity mode, because link.state() is
+-        #     SETUP ONLY behind _require_idle and `move` would fight the
+-        #     velocity loop for the same motors -- and BEFORE step 4 closes
+-        #     the port, because it needs both to read and to command.
++        #     it must come AFTER the loop threads are joined and after step 2a
++        #     has left velocity mode, because link.state() is SETUP ONLY behind
++        #     _require_idle and `move` would fight the velocity loop for the
++        #     same motors -- and BEFORE step 4 closes the port, because it
++        #     needs both to read and to command.
+         #
+         #     Wrapped completely, and it must stay that way: a shutdown path
+         #     that can raise is one that leaves motors enabled, and no
+--- turret_host/homing.py
++++ turret_host/homing.py
+@@ -528,9 +528,14 @@
+                 "so every angle this routine reads back would be a lie. Stop "
+                 "tracking first.")
+         if vel.get("tripped"):
+-            raise HomingError("the velocity watchdog is TRIPPED -- clear it "
+-                              "before homing; the motors were parked "
+-                              "mid-command and the position is unknown.")
++            st = self._clear_vel_latch(st)
++            vel = st.get("velocity", {})
++            if vel.get("tripped"):
++                raise HomingError(
++                    "the velocity watchdog is TRIPPED and would not clear. "
++                    "`velmode on` then `velmode off` is what resets it; both "
++                    "were sent and `state` still reports it set, so the board "
++                    "is not accepting commands the way this routine assumes.")
+ 
+         for name, ax in st.get("axes", {}).items():
+             if ax.get("mode") == "vel":
+@@ -567,6 +572,43 @@
+ 
+         self._say("link ok, platform idle at pitch %+.3f yaw %+.3f"
+                   % (p["pitch"], p["yaw"]), 0.04)
++
++    def _clear_vel_latch(self, st: dict) -> dict:
++        """Reset the firmware watchdog latch, then re-read `state`.
++
++        WHY THIS IS NOT A REAL ERROR ANY MORE. The latch is
++        VelocityLoop._tripped in stepper.py. It is cleared by start() and by
++        every accepted `vel`, and -- this is the bug -- NOT by stop(). So
++        `velmode off` ends the velocity session and leaves the latch set for
++        ever, and the NEXT run reads it here and refuses. A trip at the end of
++        the previous run is now the ordinary case, not an anomaly: the host
++        stops sending `vel` at shutdown and the 400 ms watchdog fires by
++        design, every single time.
++
++        The operator cleared this by hand three times on 2026-09-20 with
++        exactly the sequence below, which is the whole argument for doing it
++        here instead.
++
++        WHAT IS NOT LOST BY CLEARING IT. The latch's stated meaning is "the
++        motors were parked mid-command and the position is unknown". Homing is
++        about to establish position from MEASUREMENT -- gravity for pitch, the
++        magnetometer for yaw -- so a stale step counter is what it exists to
++        replace. The cumulative `trips` counter is untouched and still reports
++        the history; only the latch is reset. It is reported, not silenced.
++        """
++        trips = (st.get("velocity") or {}).get("trips")
++        self._say("the velocity watchdog latch is set from the previous run "
++                  "(%s trips on this board) -- clearing it" % trips, 0.015)
++        try:
++            # `velmode on` is the reset: VelocityLoop.start() sets
++            # _tripped = False. `off` immediately after leaves the platform
++            # idle, which is the state the rest of this routine needs.
++            self._cmd("velmode on", 5.0)
++            self._cmd("velmode off", 5.0)
++        except Exception as exc:                           # noqa: BLE001
++            self._say("could not clear the watchdog latch: %s" % exc, 0.015)
++            return st
++        return self._state()
+ 
+     # ---------------------------------------------------------- 2. imu cal
+ 

@@ -1,0 +1,51 @@
+{
+  "iteration": 1,
+  "label": "as-found-from-board",
+  "captured_utc": "2026-09-17T00:47:47+00:00",
+  "source": "read from Pico COM5 (2e8a:0005)",
+  "micropython": "v1.29.0 on 2026-08-24, RP2040",
+  "uploaded": false,
+  "changes": "none - pristine capture of the firmware already flashed",
+  "files": {
+    "cli.py": {
+      "bytes": 38627,
+      "sha256": "30d0c53fa1218351"
+    },
+    "config.py": {
+      "bytes": 16731,
+      "sha256": "6560d07b9a79ed03"
+    },
+    "diagnostics.py": {
+      "bytes": 30063,
+      "sha256": "fab2760add71fee5"
+    },
+    "endstop.py": {
+      "bytes": 6972,
+      "sha256": "9185c5eb0d1c91eb"
+    },
+    "imu.py": {
+      "bytes": 8313,
+      "sha256": "7c676da6e1879158"
+    },
+    "kinematics.py": {
+      "bytes": 14677,
+      "sha256": "5c783d403b6ec076"
+    },
+    "main.py": {
+      "bytes": 1452,
+      "sha256": "b1554d5b7478e1db"
+    },
+    "peripherals.py": {
+      "bytes": 14142,
+      "sha256": "c28bbd5e3490792c"
+    },
+    "pinmap.py": {
+      "bytes": 13443,
+      "sha256": "f386628f0751d2f9"
+    },
+    "stepper.py": {
+      "bytes": 48569,
+      "sha256": "ea8992d2e085e39c"
+    }
+  }
+}

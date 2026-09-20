@@ -1,0 +1,53 @@
+{
+  "iteration": 12,
+  "label": "level-axis-agnostic-total-tilt",
+  "uploaded_utc": "2026-09-19T05:02:43+00:00",
+  "uploaded": true,
+  "files_sent": [
+    "cli.py"
+  ],
+  "failed": [],
+  "source": "firmware\\current",
+  "files": {
+    "cli.py": {
+      "bytes": 54732,
+      "sha256": "447c65b433ae07a5"
+    },
+    "config.py": {
+      "bytes": 18232,
+      "sha256": "7bbbf2a5956a48bf"
+    },
+    "diagnostics.py": {
+      "bytes": 30063,
+      "sha256": "fab2760add71fee5"
+    },
+    "endstop.py": {
+      "bytes": 6972,
+      "sha256": "9185c5eb0d1c91eb"
+    },
+    "imu.py": {
+      "bytes": 14881,
+      "sha256": "849d7f34b3d9b75d"
+    },
+    "kinematics.py": {
+      "bytes": 14677,
+      "sha256": "5c783d403b6ec076"
+    },
+    "main.py": {
+      "bytes": 1452,
+      "sha256": "b1554d5b7478e1db"
+    },
+    "peripherals.py": {
+      "bytes": 14142,
+      "sha256": "c28bbd5e3490792c"
+    },
+    "pinmap.py": {
+      "bytes": 13443,
+      "sha256": "f386628f0751d2f9"
+    },
+    "stepper.py": {
+      "bytes": 48569,
+      "sha256": "ea8992d2e085e39c"
+    }
+  }
+}
