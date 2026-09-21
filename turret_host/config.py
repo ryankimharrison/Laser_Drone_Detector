@@ -1122,7 +1122,7 @@ VEL_DIR_RESYNC_ON_ENTRY = True
 #: registered view is now the more truthful of the two and there is no reason
 #: to make an operator go and find it. Falls back to the plain WIDE pane on
 #: its own if calibration/wide_narrow_registration.json is missing.
-FUSED_VIEW_DEFAULT = False   # 2026-09-20 lead: the fused Tk path has never run; it threw on every tick of gui_run8. Keep the classic panes default for live tests.
+FUSED_VIEW_DEFAULT = True
 
 #: Direction of the range-dependent parallax correction: 0 OFF, +1 or -1 once
 #: it has been MEASURED. Not a tuning knob -- a wrong sign does not halve the

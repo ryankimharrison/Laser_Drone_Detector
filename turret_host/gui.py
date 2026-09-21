@@ -342,7 +342,10 @@ class TurretGUI:
         # plain WIDE, which is exactly the old behaviour.
         self._reg = WideNarrowRegistration.load()
         self._warper = Warper(self._reg) if self._reg is not None else None
-        self._fused = bool(config.FUSED_VIEW_DEFAULT) and self._reg is not None
+        # The operator view is always fused when its registration exists.
+        # A missing calibration still falls back to WIDE so the panel remains
+        # usable on a newly built machine.
+        self._fused = self._reg is not None
         # Beam positions measured independently in each camera, from the
         # Gray-code capture. Kept from the legacy file: they are measurements
         # of the beam, not of the registration, so the new fit does not
@@ -492,7 +495,7 @@ class TurretGUI:
         # Title bar, taskbar and a little slack. Generous on purpose: a panel
         # whose E-STOP is one pixel off the bottom of the screen is worse than
         # one whose panes are 40 px smaller than they could have been.
-        margin_h, margin_w = 96, 60
+        margin_h, margin_w = 72, 60
 
         avail_h = screen_h - chrome_h - margin_h
         avail_w = screen_w - chrome_w - margin_w
@@ -591,16 +594,16 @@ class TurretGUI:
         bar.columnconfigure(0, weight=1)
         self.root.columnconfigure(0, weight=1)
 
-        self._banner = tk.Frame(bar, bg="#243447", height=104)
+        self._banner = tk.Frame(bar, bg="#243447", height=78)
         self._banner.grid(row=0, column=0, sticky="ew")
         self._banner.grid_propagate(False)
         self._banner.columnconfigure(0, weight=1)
 
         self._banner_text = tk.Label(self._banner, text="SEARCH", bg="#243447", fg=FG,
-                                     font=(FONT_UI, 36, "bold"))
-        self._banner_text.grid(row=0, column=0, sticky="ew", pady=(6, 0))
+                                     font=(FONT_UI, 28, "bold"))
+        self._banner_text.grid(row=0, column=0, sticky="ew", pady=(3, 0))
         self._banner_sub = tk.Label(self._banner, text="", bg="#243447", fg=MUTED,
-                                    font=(FONT_UI, 11))
+                                    font=(FONT_UI, 10))
         self._banner_sub.grid(row=1, column=0, sticky="ew")
 
         side = tk.Frame(bar, bg=PANEL)
@@ -608,7 +611,7 @@ class TurretGUI:
         tk.Label(side, text="LASER", bg=PANEL, fg=MUTED, font=(FONT_UI, 9, "bold")).pack()
         self._arm_lamp = tk.Label(side, text="DISARMED", bg=PANEL, fg=MUTED,
                                   font=(FONT_UI, 18, "bold"), width=11)
-        self._arm_lamp.pack(pady=(2, 4))
+        self._arm_lamp.pack(pady=(1, 2))
         self._link_lamp = tk.Label(side, text="LINK: --", bg=PANEL, fg=MUTED,
                                    font=(FONT_MONO, 9))
         self._link_lamp.pack()
@@ -649,7 +652,10 @@ class TurretGUI:
         wide_box.grid(row=0, column=0, sticky="ew")
         self._wide_heading = ttk.Label(
             wide_box,
-            text=f"WIDE  {config.WIDE_SIZE[0]}x{config.WIDE_SIZE[1]}  (all detections + faces)",
+            text=(f"FUSED  WIDE + REGISTERED NARROW  {config.WIDE_SIZE[0]}x"
+                  f"{config.WIDE_SIZE[1]}" if self._fused else
+                  f"WIDE  {config.WIDE_SIZE[0]}x{config.WIDE_SIZE[1]}  "
+                  "(registration unavailable)"),
             style="Head.TLabel", background=PANEL)
         self._wide_heading.pack(anchor="w", padx=6, pady=(4, 2))
         self._canvas_wide = tk.Canvas(wide_box, width=self._pane_w[0], height=self._pane_w[1],
@@ -718,7 +724,7 @@ class TurretGUI:
         bar.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
 
         track = tk.Frame(bar, bg=PANEL)
-        track.pack(side="left", padx=8, pady=8)
+        track.pack(side="left", padx=8, pady=4)
         tk.Label(track, text="TRACKING", bg=PANEL, fg=MUTED,
                  font=(FONT_UI, 9, "bold")).pack(anchor="w")
         row = tk.Frame(track, bg=PANEL)
@@ -729,7 +735,7 @@ class TurretGUI:
         self._btn_stop.pack(side="left")
 
         laser = tk.Frame(bar, bg=PANEL)
-        laser.pack(side="left", padx=8, pady=8)
+        laser.pack(side="left", padx=8, pady=4)
         tk.Label(laser, text="LASER MASTER ARM", bg=PANEL, fg=MUTED,
                  font=(FONT_UI, 9, "bold")).pack(anchor="w")
         row = tk.Frame(laser, bg=PANEL)
@@ -742,7 +748,7 @@ class TurretGUI:
         self._btn_disarm.pack(side="left")
 
         plat = tk.Frame(bar, bg=PANEL)
-        plat.pack(side="left", padx=8, pady=8)
+        plat.pack(side="left", padx=8, pady=4)
         tk.Label(plat, text="PLATFORM (idle only)", bg=PANEL, fg=MUTED,
                  font=(FONT_UI, 9, "bold")).pack(anchor="w")
         row = tk.Frame(plat, bg=PANEL)
@@ -759,14 +765,14 @@ class TurretGUI:
         # the loop runs, and watching the wrist move is most useful precisely
         # then.
         view = tk.Frame(bar, bg=PANEL)
-        view.pack(side="left", padx=8, pady=8)
+        view.pack(side="left", padx=8, pady=4)
         tk.Label(view, text="VIEW", bg=PANEL, fg=MUTED,
                  font=(FONT_UI, 9, "bold")).pack(anchor="w")
         row = tk.Frame(view, bg=PANEL)
         row.pack()
         self._btn_wrist = self._button(row, "3D Wrist", self._toggle_wrist_view, width=10)
         self._btn_wrist.pack(side="left")
-        self._btn_fused = self._button(row, "FUSED", self._toggle_fused, width=10)
+        self._btn_fused = self._button(row, "FUSED ON", self._toggle_fused, width=10)
         self._btn_fused.pack(side="left", padx=(4, 0))
         # PARALLAX cycles the range correction -1 / 0 / +1. It is a control
         # rather than a setting because the sign is NOT KNOWN -- see
@@ -783,14 +789,13 @@ class TurretGUI:
             self._btn_fused.configure(state="disabled")
             self._btn_parallax.configure(state="disabled")
         else:
-            self._btn_fused.configure(bg=CYAN if self._fused else PANEL_HI,
-                                      fg="#00222c" if self._fused else FG)
+            self._btn_fused.configure(bg=CYAN, fg="#00222c", state="disabled")
             self._sync_parallax_button()
 
         stop = tk.Frame(bar, bg=PANEL)
-        stop.pack(side="right", padx=8, pady=8)
+        stop.pack(side="right", padx=8, pady=4)
         self._btn_estop = self._button(stop, "E-STOP", self._do_estop, fg=WHITE, bg="#b3000f",
-                                       font=(FONT_UI, 20, "bold"), width=12, height=2)
+                                       font=(FONT_UI, 17, "bold"), width=12, height=1)
         self._btn_estop.pack()
         self._btn_clear_estop = self._button(stop, "clear E-STOP", self._do_clear_estop,
                                              font=(FONT_UI, 9), width=12)
@@ -801,14 +806,14 @@ class TurretGUI:
         box.grid(row=3, column=0, sticky="ew", padx=8, pady=4)
         self._progress_title = tk.Label(box, text="HOMING", bg=PANEL, fg=MUTED,
                                         font=(FONT_UI, 9, "bold"), width=12, anchor="w")
-        self._progress_title.pack(side="left", padx=(10, 6), pady=8)
+        self._progress_title.pack(side="left", padx=(10, 6), pady=4)
         self._progress_bar = ttk.Progressbar(box, style="Turret.Horizontal.TProgressbar",
                                              orient="horizontal", length=380,
                                              mode="determinate", maximum=1.0, value=0.0)
-        self._progress_bar.pack(side="left", pady=8)
+        self._progress_bar.pack(side="left", pady=4)
         self._progress_text = tk.Label(box, text="idle", bg=PANEL, fg=FG, font=(FONT_MONO, 10),
                                        anchor="w")
-        self._progress_text.pack(side="left", padx=10, pady=8, fill="x", expand=True)
+        self._progress_text.pack(side="left", padx=10, pady=4, fill="x", expand=True)
         # The elapsed counter is the whole point of this strip: homing takes
         # tens of seconds and a frozen number is what "hung" looks like.
         self._progress_clock = tk.Label(box, text="", bg=PANEL, fg=MUTED,
@@ -947,16 +952,9 @@ class TurretGUI:
                      "is missing. Run tools/fit_wide_narrow_registration.py "
                      "--write (offline, no hardware).", "warn")
             return
-        self._fused = not self._fused
-        self._btn_fused.configure(bg=CYAN if self._fused else PANEL_HI,
-                                  fg="#00222c" if self._fused else FG)
-        # Force a repaint: _draw_panes skips when the frame sequence has not
-        # advanced, so without this the pane keeps the old rendering until the
-        # next frame arrives -- which looks like the button did nothing.
-        self._frame_seq_drawn = -1
-        self.log("fused view %s (registered at %.2f m, RMS %.2f narrow px)"
-                 % ("ON" if self._fused else "OFF",
-                    self._reg.range_m, self._reg.rms_px), "info")
+        self._fused = True
+        self.log("fused view is always on (registered at %.2f m, RMS %.2f "
+                 "narrow px)" % (self._reg.range_m, self._reg.rms_px), "info")
 
     def _sync_parallax_button(self) -> None:
         sign = self._reg.parallax_sign if self._reg else 0
