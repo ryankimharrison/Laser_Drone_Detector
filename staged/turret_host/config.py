@@ -288,7 +288,7 @@ J_PX_PER_STEP = None                    # set by calibration; None = not calibra
 # magnitude before using them to judge anything.
 CONTROL_GAIN_K = 1.2
 ERROR_DEADBAND_PX = 1.0                 # on the P term only
-MAX_MOTOR_RATE = 4000                   # steps/s, clipped before send
+MAX_MOTOR_RATE = 1600   # 2026-09-20 run_184448: 4000 is the UNLOADED top; loaded, every 5 s window at or below 1607 steps/s delivered ~0.95 of commanded angle (gyro-integrated) and the one window at 2468 delivered 0.02 (stall, DR ran away 70 deg). Threshold is somewhere in 1800-2470; bench one motor at a time before raising.
 # 2026-09-20: slew cap while the controlling box is WIDE-SOURCED. Measured on
 # run_2026-09-20_122343: the wide box is 100-160 ms old and arrives at 6-12 Hz,
 # and at the 50-65 deg/s the P law commanded from it the narrow camera saw only
@@ -296,7 +296,7 @@ MAX_MOTOR_RATE = 4000                   # steps/s, clipped before send
 # tripped the attitude envelope. 600 steps/s on the faster motor is ~29 deg/s of
 # payload: ~4 deg of staleness error at 150 ms, ~11 px of blur at exposure -6.
 # Direction-preserving scale, applied in app._control_loop. 0 disables.
-WIDE_MAX_MOTOR_RATE = 600
+WIDE_MAX_MOTOR_RATE = 1500   # 2026-09-20 run_184448: at 3000 the wrist STALLED (DR drifted 70 deg while gravity moved ~5) in the 2000+ steps/s windows; stall onset looks like ~1300-1500 under load. 600 was too slow (run_183021). Pending the intern's delivery-vs-rate bins.
 # 2026-09-20: while a track is live, the wide fallback may substitute for the
 # narrow detector only after this many CONSECUTIVE narrow misses. Measured on
 # run_2026-09-20_123719 (static drone): every one of 24 single-frame narrow
@@ -526,20 +526,43 @@ PLATFORM_COMPENSATION = False
 # fiducial recordings to validate. A scalar "delivery factor" fudge is NOT
 # acceptable here -- it would mask the circularity in (2) rather than remove it.
 #
-# Leaving the flag in place, OFF, because the diagnosis is worth keeping and
-# the logging it added (cmd.v_target_*, cmd.ff_platform_px_s, cmd.omega_at_box)
-# is what makes the real fix measurable. Enabling it degrades tracking; it does
-# not create a safety hazard, because the laser interlock gates firing on
-# MAX_ERROR_TO_FIRE_PX independently of the feedforward.
-FEEDFORWARD_SUBTRACT_PLATFORM = False  # 2026-09-20: run_124411 was a feedforward
-# RUNAWAY on a static target (est.du -299 px/s of the turret's own slew fed
-# forward, error 15 -> 1065 px in 1.6 s). Enabling this was checked on those
-# rows: J @ omega_at_box is ANTI-parallel to est.du (cos -0.98, 46/46 rows), so
-# the subtraction would double the feedforward. Stays OFF. See FEEDFORWARD_GAIN.
+# ON as of 2026-09-20. THE OPERATION WAS ALWAYS RIGHT; THE DEFAULT WAS WRONG.
+#
+# The name says "subtract" and the code subtracts pixel_rates(), and that is
+# correct -- but only because pixel_rates() is ALREADY NEGATED. It returns the
+# pixel rate the loop must COMMAND, not the pixel motion a rotation CAUSES;
+# those are opposite, which is why `omega = -jacobian.motor_rates(...)` carries
+# a minus sign. So subtracting it here ADDS the platform's physical
+# contribution back, which is what recovers the target's inertial velocity.
+#
+# Verified against the gyro, which reads body rotation directly and is never
+# fed back into the loop: cos(J @ omega_at_box, f * gyro) = -0.93 over 758 rows
+# of run_2026-09-20_184448. Anti-parallel, as the convention above predicts.
+#
+# MEASURED on the 808 TRACK rows of run_2026-09-20_184448 where optical flow
+# answered, scoring each candidate feedforward against the error direction, and
+# the fraction of rows whose NET command at FEEDFORWARD_GAIN 0.5 would point
+# AWAY from the error:
+#     v_image alone (what shipped) : agrees 35%, median cos -0.68, away 13.0%
+#     v_image + J @ omega          : agrees 17%, median cos -0.93, away 38.4%
+#     v_image - J @ omega  (ON)    : agrees 58%, median cos +0.51, away  2.8%
+#
+# WHY IT WAS OFF, AND WHY THAT REASONING DOES NOT SURVIVE. run_124411 was a
+# feedforward RUNAWAY on a STATIC target (est.du -299 px/s of the turret's own
+# slew fed forward, error 15 -> 1065 px in 1.6 s), and the note concluded that
+# subtracting would double the feedforward. The runaway was real, but the term
+# was never enabled during it -- what ran away was the RAW image velocity,
+# which on a static target IS the platform's own slew. Subtracting the platform
+# term is what removes it. On a static target this flag drives the feedforward
+# to ~0, which is the correct feedforward there.
+#
+# Skipped when the feedforward tier is "none": -J @ omega on its own is the
+# platform's own motion fed forward, which is the 124411 failure exactly.
+FEEDFORWARD_SUBTRACT_PLATFORM = True
 # 2026-09-20: multiplier on the velocity feedforward (est.du/dv). 0.0 = pure
 # proportional law, which cannot run away on its own motion; cost is a standing
 # lag of v_target / CONTROL_GAIN_K on a moving target. Set for the demo night.
-FEEDFORWARD_GAIN = 0.0   # 2026-09-20 demo: run_142953 showed the feedforward flipping +-150-300 px/s frame to frame on a target moving <100 px/s (6-8 reversals/s, beam pulsing); pure P is smoother and cannot chase its own motion
+FEEDFORWARD_GAIN = 0.0   # 2026-09-20 ramp step 1 FAILED on run_203933: at 0.5 the beam-to-centre median went 94 -> 172 px, head ran to +63 deg pitch and tripped the 85 deg envelope (never armed). Back to 0 per the rule; intern to diagnose before any retry
 # backwards in velocity mode (firmware iteration 14 fixed the DIR cache), not the
 # feedforward. 1.0 is the configuration that held the static drone for 88 s in run_123719.
 
@@ -839,7 +862,8 @@ FACE_CONF = 0.6
 LASER_ENABLED = True                    # master arm -- enabled by the operator 2026-09-18
 FACE_INHIBIT_MARGIN_PX = 120            # no face within this of the beam path
 MAX_ERROR_TO_FIRE_PX = 60   # 2026-09-20 operator: 25 -> 60 for the moving-drone demo (~2.5 deg, inside a ~200 px airframe)
-LASER_MAX_ON_MS = 2000
+LASER_MAX_ON_MS = 5000                  # 2026-09-20 Ryan: 2000 -> 5000; the 2 s cap + equal cooldown cost 52 rows in run_145109 and made the box hold a regression
+LASER_COOLDOWN_MS = 500                 # 2026-09-20: rest after a capped burst (was equal to LASER_MAX_ON_MS)
 SETTLED_RATE_DEG_S = 40.0               # 2026-09-20 operator: 5 -> 40 so the beam can stay on while the drone moves
 # -- shape gate (2026-09-20, after run_145109 frame 006835) ------------------
 # The beam fired on the carrier's HAND: the drone was edge-on behind the fingers,
@@ -851,7 +875,7 @@ SETTLED_RATE_DEG_S = 40.0               # 2026-09-20 operator: 5 -> 40 so the be
 # the two armed runs of 2026-09-20: 34/2149 and 6/1844 TRACK rows, 1 firing row
 # (the hand). This does NOT protect a hand inside a drone-shaped box; keep the
 # grip outside the airframe (hold a landing leg) until a hand detector exists.
-FIRE_BOX_ASPECT_MIN = 0.45
+FIRE_BOX_ASPECT_MIN = 0.30   # 0.45 -> 0.30: the drone edge-on or folded is 0.39-0.48 (real airframe, frames checked); the hand signature is WIDE, so the floor is only a sanity bound
 FIRE_BOX_ASPECT_MAX = 1.6
 
 # -- fail-closed permission ------------------------------------------------
@@ -933,6 +957,83 @@ ASSOC_BOX_ASPECT_MAX = 1.6
 #: above. GATE_MAX_PX (300) still caps everything.
 ASSOC_LONE_PX = 250.0
 ASSOC_LONE_CONF = 0.5
+
+# --------------------------------------------------------------------------
+#   OPTICAL-FLOW VELOCITY FOR THE FEEDFORWARD  (item 6)
+# --------------------------------------------------------------------------
+# See turret_host/flowvel.py for the measurements behind these. In short:
+# differencing box centres is beaten by NAIVE at the 100-200 ms horizons, and
+# its frame-to-frame jump of 130-190 px/s is what flipped the feedforward's
+# sign. Flow on the box patch cuts that to 26-51 px/s and halves the prediction
+# error at the 66 ms loop latency.
+#
+# FEEDFORWARD_GAIN IS STILL 0.0. This ships the SOURCE and the logging only.
+# Raising the gain is a hardware exercise -- a wrong feedforward cannot be
+# scored by replay, because the turret would have moved differently -- so the
+# 0 -> 0.5 -> 1.0 ramp waits for a run on the rig.
+
+#: Search margin around the box, as a fraction of its size. The features come
+#: from inside the box; this is only room for them to move into.
+FLOW_ROI_PAD = 0.35
+#: Corners to ask for. 120 gives a MEASURED median of 118 survivors.
+FLOW_MAX_CORNERS = 120
+#: Fewer survivors than this is not a measurement.
+FLOW_MIN_POINTS = 6
+#: Forward-backward reprojection limit, px. A point that does not track home
+#: again did not track.
+FLOW_FB_MAX_PX = 1.0
+#: Median absolute deviation of the surviving vectors, px. Above this they
+#: disagree with each other and their median means nothing.
+#:
+#: This is the FLOOR of the guard, not the whole guard -- see
+#: FLOW_COHERENCE_FRAC. On its own it was a SPEED GATE, because the quantity it
+#: thresholds grows with the motion being measured.
+FLOW_COHERENCE_PX = 3.0
+#: ...and this fraction of the median displacement, whichever is larger.
+#:
+#: MEASURED on run_2026-09-20_203933, replaying flowvel.py over the run's own
+#: raw frames (623 rows reached this test). The MAD grows with platform rate
+#: while its RATIO to the displacement does not:
+#:
+#:     gyro deg/s    n    med MAD   med disp   MAD/disp   rejected
+#:        0-10     105      1.55      12.68       0.11       25%
+#:       10-20     200      1.68      13.19       0.12       26%
+#:       20-35     222      2.11      20.43       0.11       34%
+#:       35-55      93      2.47      25.40       0.09       33%
+#:
+#: So a fixed 3.0 px cut rejects more of exactly the fast rows the feedforward
+#: exists to help, and it did: 25% of the 492 no-feedforward rows in that run
+#: were this guard firing. Tier-none rows carried a 252 px error floor and a
+#: 0.70 s lag against 69 px and 0.27 s on flow rows.
+#:
+#: VALIDATED before relaxing, by predicting the NEXT frame's box displacement
+#: from the flow measured on the previous interval -- a reference the flow did
+#: not produce:
+#:     accepted today   n=416  err  8.2 px vs 14.6 naive, beats naive 75%
+#:     this rule adds   n=148  err 14.3 px vs 36.1 naive, beats naive 88%
+#:     still rejected   n= 15  err 10.6 px vs 10.3 naive, beats naive 33%
+#: The recovered rows are the FAST ones and flow more than halves their error.
+#: The rows this still drops are the ones where flow genuinely adds nothing.
+#:
+#: 0.35 was chosen as roughly 3x the observed MAD/disp ratio (~0.11): loose
+#: enough to clear the real spread, tight enough that the "spray of noise that
+#: happens to average to something" the guard was written for still fails it.
+FLOW_COHERENCE_FRAC = 0.35
+#: A larger gap than this between frames is not a frame interval.
+FLOW_MAX_DT_S = 0.25
+#: How long the last flow velocity may be used after flow goes silent, ramped
+#: LINEARLY to zero across the window. TWO frames at 30 fps, and 0.070 rather
+#: than 0.0667 on purpose: at exactly two frame periods the second frame lands
+#: on the boundary and is rejected by the `age <= FLOW_HOLD_S` test, so the
+#: hold is one frame, not two. Caught by the behavioural test. The margin is
+#: small enough that a third frame (100 ms) is still firmly outside.
+#:
+#: The fallback after that is ZERO feedforward -- pure P -- and deliberately
+#: NOT the Kalman velocity: its own frame-to-frame jump is still 85/250 px/s
+#: median/p90 on the fast run, and the blurred frames where flow goes silent
+#: are exactly where that would flip sign. Pure P costs bounded lag; a
+#: wrong-signed feedforward does not.
+FLOW_HOLD_S = 0.070
 # Shrink the box per side before testing containment, as a fraction of its own
 # width/height so it scales with range. The 283 mm airframe is ~132 px at 3 m,
 # so 0.15 leaves ~92 px of permitted region there -- the body, not the rim,
@@ -959,6 +1060,47 @@ LASER_PULSE_HZ = 15                     # half the 30 fps capture: present/absen
 DISPLAY_SIZE = (640, 360)               # draw on a copy, never the inference buffer
 DISPLAY_FPS = 30
 
+# ==========================================================================
+#   POSE OVERLAY -- measured attitude against the dead-reckoned pose
+#
+#   The 3D inset in the corner of the wide pane draws the wrist twice: solid
+#   from the payload accelerometer, ghost from motor step counting. The gap
+#   between them is the mechanical error the control loop cannot see --
+#   backlash, lost steps, compliance, slip. See turret_host/wristview.py.
+# ==========================================================================
+POSE_OVERLAY = True                     # draw the inset at all
+POSE_OVERLAY_SIZE = (260, 182)          # inset pixels, inside DISPLAY_SIZE
+POSE_OVERLAY_CORNER = "br"              # tl | tr | bl | br. "br" clears the fps caption bottom-left
+POSE_OVERLAY_MARGIN = 8
+POSE_OVERLAY_FPS = 4                    # 12 -> 4 (2026-09-20 lead): ~52 ms/render was 0.6 core during tracking; keep k visible, cut the cost
+
+#: The overlay's solid model takes its pitch MAGNITUDE from gravity and its
+#: SIGN from the ghost, so there is no independent IMU sign constant to get
+#: wrong -- and no sign check is possible either. What is independent is the
+#: magnitude, and these govern the ratio it is checked against. See
+#: app.TurretApp._check_pose_scale.
+#:
+#: Only samples past this many degrees from the datum count. Large enough that
+#: the 0.65-2.3 deg of measured backlash is a small fraction of the probe,
+#: which is what every previous measurement of this ratio failed to do.
+POSE_SCALE_MIN_DEG = 20.0
+POSE_SCALE_WINDOW = 200                 # samples before the median is trusted
+POSE_SCALE_TOL = 0.06                   # |k - 1| past this is reported
+
+#: Below this the accelerometer is trusted as a tilt measurement. Above it the
+#: payload is moving, |a| is gravity PLUS the tangential acceleration of an IMU
+#: 42.5 mm off the pitch axis, and the reading is not tilt. The solid model is
+#: marked unreliable rather than filtered -- see the note on the complementary
+#: filter in app.TurretApp._measured_pitch.
+POSE_STILL_RATE_DPS = 6.0
+
+#: Smoothing on the measured pitch, seconds. One sample period at
+#: ATTITUDE_SAMPLE_HZ is 0.1 s; this is deliberately short, because the
+#: backlash snap at a reversal is the most useful thing the display shows and
+#: a long time constant would smooth it away.
+POSE_SMOOTH_TAU_S = 0.12
+
+
 # 2026-09-20: before the first non-zero `vel` of a link's life, send one
 # negative and one positive tick-sized rate so the firmware writes both DIR
 # pins from a standstill. Firmware <= iteration 13 cached the direction and
@@ -968,3 +1110,85 @@ DISPLAY_FPS = 30
 # tracking slews down-right' failure. Iteration 14 fixes the firmware; this
 # stays on as the guard for an unflashed board. Costs two round trips once.
 VEL_DIR_RESYNC_ON_ENTRY = True
+
+# ==========================================================================
+#   FUSED VIEW  (both cameras registered into one pane)
+# ==========================================================================
+#: FUSED is the DEFAULT pane now, not an opt-in button. It was opt-in while
+#: the registration was a plain homography that was visibly wrong away from
+#: the centre; tools/fit_wide_narrow_registration.py fixed that, so the
+#: registered view is now the more truthful of the two and there is no reason
+#: to make an operator go and find it. Falls back to the plain WIDE pane on
+#: its own if calibration/wide_narrow_registration.json is missing.
+FUSED_VIEW_DEFAULT = False   # 2026-09-20 lead: the fused Tk path has never run; it threw on every tick of gui_run8. Keep the classic panes default for live tests.
+
+#: Direction of the range-dependent parallax correction: 0 OFF, +1 or -1 once
+#: it has been MEASURED. Not a tuning knob -- a wrong sign does not halve the
+#: error, it doubles it, and config.py already says twice over that this
+#: family of sign must never be hand-derived from the CAD numbers.
+#:
+#: It is 0 because it is genuinely not known. Both Gray-code captures are at
+#: the same range (2.0828 m), so the sign is not observable from the
+#: calibration data at all -- only the magnitude is, and that comes out as
+#: 79.8 px*m, i.e. 0 at the calibration plane, -12 narrow px at 3 m, -22 at
+#: 5 m, -38 at infinity.
+#:
+#: TO MEASURE IT: put something 4-5 m away, open the panel, and press the
+#: PARALLAX button to cycle -1 / 0 / +1. One sign visibly closes the double
+#: image and the other visibly doubles it. Put the winner here. Do it at 4-5 m
+#: and NOT at 2 m: at the calibration plane the correction is zero by
+#: construction and all three settings look identical, which reads as "the
+#: control does nothing" rather than as "you are standing in the one place
+#: that cannot answer the question".
+FUSED_PARALLAX_SIGN = 0
+
+#: Above this narrow-vs-wide capture-time difference the fused pane says so,
+#: in amber, on the pane. It does not refuse to draw -- a stale composite is
+#: still worth looking at as long as nobody mistakes it for a registration
+#: error, which is exactly what it looks like.
+#:
+#: MEASURED on run_2026-09-20_151635, 10209 narrow frames against their
+#: nearest wide frame: median 28.4 ms, p90 69.5, p99 121.9, max 181.1, and
+#: only 41.5% of pairs inside 25 ms. The wide detector is throttled to
+#: WIDE_SEARCH_FPS_TRACKING while narrow runs at 30, so this is by design and
+#: not a fault. It matters because 28 ms of skew at 30 deg/s of platform
+#: motion displaces the two layers by ~21 narrow px (25 px/deg as mounted) --
+#: comparable to the whole registration error the distortion fit just removed,
+#: and larger than the depth-parallax term. While the turret slews, skew is
+#: the dominant term in what an operator sees, and no calibration can fix it.
+#: 40 sits just above the median so a normal frame does not cry wolf.
+FUSED_MAX_FRAME_SKEW_MS = 40.0
+
+# ==========================================================================
+#   PANEL GEOMETRY
+# ==========================================================================
+#: The camera panes are sized to the screen at startup, between these bounds,
+#: instead of being pinned to DISPLAY_SIZE.
+#:
+#: DISPLAY_SIZE (640x360) used to be BOTH the drawing raster and the pane
+#: size, and the pane could only ever be scaled DOWN from it. On this rig that
+#: is what made the panes unusably small: the narrow pane is rotated 90 deg so
+#: it is 640 px TALL, the old chrome_px guess of 540 left only 234 px for it
+#: on a 1536x864 logical screen, and the shrink clamped at its 0.5 floor -- so
+#: the panes rendered at 320x180 and 180x320 and were then bitmap-stretched
+#: another 1.25x by Windows because the process was not DPI aware.
+#:
+#: Now the raster IS the pane: frames are drawn straight at pane resolution,
+#: so there is no resample at blit time and no upscaling of text. Overlay
+#: fonts and line widths scale with DISPLAY_SCALE_REF so they keep their
+#: proportions instead of shrinking into the picture.
+DISPLAY_MIN_SIZE = (640, 360)
+DISPLAY_MAX_SIZE = (1600, 900)
+#: Overlay metrics (fonts, line widths, marker sizes) were all chosen against
+#: a 640-wide pane. They are multiplied by pane_width / this.
+DISPLAY_SCALE_REF = 640.0
+
+#: Tell Windows this process scales itself, before Tk exists.
+#:
+#: Without it Tk is handed a 1536x864 logical desktop on a 1920x1080 panel at
+#: 125% and Windows bitmap-stretches the result, so every camera pane is both
+#: smaller than it needs to be AND soft. With it the panel gets the real
+#: pixels and Tk's own scaling factor is set so point-sized fonts keep their
+#: physical size. Windows only; a no-op everywhere else, and a failure to set
+#: it is logged and ignored rather than being allowed to stop the panel.
+DISPLAY_DPI_AWARE = True

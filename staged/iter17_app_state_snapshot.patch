@@ -1,0 +1,51 @@
+# Patch for turret_host/app.py -- iteration 17 bundle, generated 2026-09-20.
+# Apply:  git apply staged/iter17_app_state_snapshot.patch
+#
+--- turret_host/app.py
++++ turret_host/app.py (iter17)
+@@ -858,6 +858,12 @@
+             on_message=lambda m: self.log(m, "warn"),
+         ).start()
+         self._run_dir = out
++        # The board's view BEFORE anything moves. Safe here: nothing is
++        # servoing yet, and link.state() is refused once it is.
++        try:
++            self.recorder.snapshot_state("start")
++        except Exception as exc:                           # noqa: BLE001
++            self.log("start STATE snapshot failed: %s" % exc, "warn")
+         self.log("FLIGHT RECORDER -> %s (IMU at %.0f Hz, dropped rather than "
+                  "delaying a vel)" % (out, self.args.record_imu_hz), "good")
+ 
+@@ -2902,7 +2908,14 @@
+                          "good")
+             except Exception as exc:                       # noqa: BLE001
+                 self.log("flight recorder close failed: %s" % exc, "warn")
++            # Held across the close so the END snapshot can still reach it.
++            # That snapshot cannot be taken here: link.state() is refused
++            # while the servo path is active, and _safe_state() has not run
++            # yet at this point in shutdown.
++            _rec_for_end = self.recorder
+             self.recorder = None
++        else:
++            _rec_for_end = None
+ 
+         # 0. A platform task owns the serial port while it runs, and its
+         #    commands BLOCK for up to 240 s (`level`) holding link._io_lock.
+@@ -2955,6 +2968,17 @@
+         #     Wrapped completely, and it must stay that way: a shutdown path
+         #     that can raise is one that leaves motors enabled, and no
+         #     diagnostic is worth that.
++        # THE END SNAPSHOT. Placed with the step check for the same reason
++        # it is: by here the loop threads are joined and _safe_state() has
++        # left velocity mode, so link.state() is allowed. session.json was
++        # written at recorder.close(), so it is re-emitted afterwards.
++        if _rec_for_end is not None and self.link is not None:
++            try:
++                _rec_for_end.snapshot_state("end")
++                _rec_for_end.rewrite_session()
++            except Exception as exc:                       # noqa: BLE001
++                self.log("end STATE snapshot failed: %s" % exc, "warn")
++
+         try:
+             if getattr(self, "_step_datum", None) is not None and self.link:
+                 rep = step_integrity.verify(self.link, self._step_datum)

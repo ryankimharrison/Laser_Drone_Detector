@@ -1,0 +1,205 @@
+--- a/turret_host/gui.py
++++ b/turret_host/gui.py
+@@ -1354,31 +1354,58 @@
+         narrow = _image_of(state["narrow"])
+         wide = _image_of(state["wide"])
+ 
++        # HOW FAR APART IN TIME THE TWO LAYERS ARE. Both slots carry a
++        # types.Frame with the capture time on it and `_image_of` drops it,
++        # so until now the fused pane composited two different moments with
++        # no way to know or say.
++        #
++        # It is not a small term. MEASURED over run_2026-09-20_151635, 10209
++        # narrow frames against their nearest wide frame: median 28.4 ms,
++        # p90 69.5, max 181.1, and only 41.5% inside 25 ms. The wide pass
++        # delivers 9-13 Hz against narrow's 30 -- compute-bound below its own
++        # WIDE_SEARCH_FPS_TRACKING throttle -- so this is by design, stationary
++        # over a run, and NOT a clock offset (signed mean -0.7 ms). At 30 deg/s
++        # of platform motion 28 ms displaces the layers by ~21 narrow px, which
++        # is larger than the depth-parallax term and looks exactly like a
++        # registration error. Showing it is the difference between an operator
++        # distrusting the calibration and understanding the picture.
++        skew_ms = None
++        fn, fw = state["narrow"], state["wide"]
++        if isinstance(fn, Frame) and isinstance(fw, Frame):
++            skew_ms = (fw.t - fn.t) * 1000.0
++
+         pil_n = self._render_narrow(narrow, state)
+         # The fused view replaces the WIDE pane, not the narrow one: it is
+         # rendered in wide coordinates at the same 16:9 aspect, so it drops
+         # into the same canvas without touching the layout, and the narrow
+         # pane stays available at full resolution for the aiming work.
+         if self._fused:
+-            pil_w = self._render_fused(narrow, wide, state)
++            pil_w = self._render_fused(narrow, wide, state, skew_ms)
+         else:
+             pil_w = self._render_wide(wide, state)
+-        # After the overlays, so the inset sits on top of boxes and captions
+-        # rather than under them; and on whichever view is in the pane, because
+-        # FUSED replaces WIDE rather than sitting beside it.
+-        self._paste_pose_inset(pil_w)
+ 
+         self._photo_narrow, self._item_narrow = self._blit(
+             self._canvas_narrow, self._item_narrow, self._photo_narrow, pil_n)
+         self._photo_wide, self._item_wide = self._blit(
+-            self._canvas_wide, self._item_wide, self._photo_wide, pil_w)
++            self._canvas_wide, self._item_wide, self._photo_wide, pil_w,
++            inset=True)
+ 
+-    def _blit(self, canvas, item, photo, pil):
++    def _blit(self, canvas, item, photo, pil, inset: bool = False):
+         if self._fit != 1.0:
+-            # Only on a screen too short for a full-size panel; overlays were
+-            # already drawn at DISPLAY_SIZE so they scale with the image.
++            # Rare now: the raster is sized to the pane, so there is usually
++            # nothing to resample. It survives for the case where the window
++            # is given a size the raster cap cannot match.
+             pil = pil.resize((max(1, int(pil.width * self._fit)),
+                               max(1, int(pil.height * self._fit))), Image.BILINEAR)
++        if inset:
++            # AFTER the resize, not before. The pose inset is a fixed-size HUD
++            # rendered at config.POSE_OVERLAY_SIZE; pasting it before a resize
++            # would rescale it along with the video and soften it for no
++            # reason. It goes on after the overlays either way, so it sits on
++            # top of boxes and captions rather than under them, and on
++            # whichever view is in the pane -- FUSED replaces WIDE rather than
++            # sitting beside it.
++            self._paste_pose_inset(pil)
+         if photo is None or (photo.width(), photo.height()) != pil.size:
+             photo = ImageTk.PhotoImage(pil)
+             if item is not None:
+@@ -1475,8 +1502,9 @@
+             for i, face in enumerate(det.faces):
+                 colour = RED if inhibited else "#c25b5b"
+                 x1, y1, x2, y2 = self._box_disp(face, to_disp)
+-                d.rectangle((x1, y1, x2, y2), outline=colour, width=3 if inhibited else 2)
+-                self._label(d, x1, y1 - 3, f"FACE {i}", WHITE, colour)
++                d.rectangle((x1, y1, x2, y2), outline=colour,
++                            width=self._lw(3) if inhibited else self._lw(2))
++                self._label(d, x1, y1 - self._sz(3), f"FACE {i}", WHITE, colour)
+ 
+         # The beam lands at the goal pixel, so the inhibit test is measured
+         # from there, not from the box centre.
+@@ -1489,12 +1517,13 @@
+             gx, gy = to_disp(*goal)
+             ring = config.FACE_INHIBIT_MARGIN_PX * scale
+             d.ellipse((gx - ring, gy - ring, gx + ring, gy + ring),
+-                      outline=RED if inhibited else "#3a4a5e", width=3 if inhibited else 1)
++                      outline=RED if inhibited else "#3a4a5e",
++                      width=self._lw(3) if inhibited else self._lw(1))
+             fire_r = config.MAX_ERROR_TO_FIRE_PX * scale
+             d.ellipse((gx - fire_r, gy - fire_r, gx + fire_r, gy + fire_r),
+                       outline=AMBER, width=1)
+-            self._cross(d, gx, gy, AMBER, size=12, width=2)
+-            self._label(d, gx + 14, gy - 6, "GOAL", AMBER)
++            self._cross(d, gx, gy, AMBER, size=self._sz(12), width=self._lw(2))
++            self._label(d, gx + self._sz(14), gy - self._sz(6), "GOAL", AMBER)
+ 
+         box: Optional[Detection] = None
+         if est is not None and est.box is not None:
+@@ -1504,33 +1533,40 @@
+         if box is not None:
+             x1, y1, x2, y2 = self._box_disp(box, to_disp)
+             colour = VIOLET if (est is not None and est.occluded) else GREEN
+-            d.rectangle((x1, y1, x2, y2), outline=colour, width=2)
++            d.rectangle((x1, y1, x2, y2), outline=colour, width=self._lw(2))
+             tag = f"{box.label} {box.conf:.2f}"
+             if est is not None and est.occluded:
+                 tag += "  OCCLUDED"
+-            self._label(d, x1, y1 - 3, tag, "#06210f" if colour == GREEN else "#12081f", colour)
++            self._label(d, x1, y1 - self._sz(3), tag,
++                        "#06210f" if colour == GREEN else "#12081f", colour)
+ 
+         if est is not None:
+             px, py = to_disp(est.u, est.v)
+-            self._cross(d, px, py, MAGENTA, size=9, width=2)
+-            d.ellipse((px - 5, py - 5, px + 5, py + 5), outline=MAGENTA, width=2)
+-            self._label(d, px + 12, py + 14, f"pred {est.du:+.0f},{est.dv:+.0f} px/s", MAGENTA)
++            self._cross(d, px, py, MAGENTA, size=self._sz(9), width=self._lw(2))
++            _r = self._sz(5)
++            d.ellipse((px - _r, py - _r, px + _r, py + _r), outline=MAGENTA,
++                      width=self._lw(2))
++            self._label(d, px + self._sz(12), py + self._sz(14),
++                        f"pred {est.du:+.0f},{est.dv:+.0f} px/s", MAGENTA)
+             if goal is not None:
+                 gx, gy = to_disp(*goal)
+                 d.line((gx, gy, px, py), fill=CYAN, width=1)
+ 
+         if dot is not None:
+             dx, dy = to_disp(float(dot[0]), float(dot[1]))
+-            d.ellipse((dx - 4, dy - 4, dx + 4, dy + 4), fill=YELLOW, outline="#000000")
++            _r = self._sz(4)
++            d.ellipse((dx - _r, dy - _r, dx + _r, dy + _r), fill=YELLOW,
++                      outline="#000000")
+             d.ellipse((dx - 9, dy - 9, dx + 9, dy + 9), outline=YELLOW, width=1)
+-            self._label(d, dx + 12, dy - 8, "DOT", "#2a2200", YELLOW)
++            self._label(d, dx + self._sz(12), dy - self._sz(8), "DOT", "#2a2200", YELLOW)
+ 
+         if inhibited:
+             # Red frame around the whole pane. Redundant with the banner on
+             # purpose -- this is the one state an operator must never miss.
+-            d.rectangle((1, 1, img.width - 2, img.height - 2), outline=RED, width=4)
++            d.rectangle((1, 1, img.width - 2, img.height - 2), outline=RED,
++                        width=self._lw(4))
+ 
+-        self._label(d, 6, img.height - 6,
++        self._label(d, self._sz(6), img.height - self._sz(6),
+                     f"NARROW  {self._status.narrow_fps:4.1f} fps"
+                     f"  rot {self._rot} CW (display only)", FG, "#000000")
+         return img
+@@ -1709,19 +1745,21 @@
+         if det is not None:
+             for t in det.targets:
+                 x1, y1, x2, y2 = self._box_disp(t, to_disp)
+-                d.rectangle((x1, y1, x2, y2), outline=CYAN, width=2)
+-                self._label(d, x1, y1 - 3, f"{t.label} {t.conf:.2f}", "#00222c", CYAN)
++                d.rectangle((x1, y1, x2, y2), outline=CYAN, width=self._lw(2))
++                self._label(d, x1, y1 - self._sz(3),
++                            f"{t.label} {t.conf:.2f}", "#00222c", CYAN)
+             for i, f in enumerate(det.faces):
+                 colour = FACE_COLOURS[i % len(FACE_COLOURS)]
+                 x1, y1, x2, y2 = self._box_disp(f, to_disp)
+-                d.rectangle((x1, y1, x2, y2), outline=colour, width=3)
++                d.rectangle((x1, y1, x2, y2), outline=colour, width=self._lw(3))
+                 # Corner ticks make overlapping faces separable at 640x360.
+-                d.line((x1, y1, x1 + 10, y1), fill=WHITE, width=2)
+-                d.line((x1, y1, x1, y1 + 10), fill=WHITE, width=2)
+-                self._label(d, x1, y2 + 13, f"FACE {i}  {f.conf:.2f}", WHITE, colour)
++                _t = self._sz(10)
++                d.line((x1, y1, x1 + _t, y1), fill=WHITE, width=self._lw(2))
++                d.line((x1, y1, x1, y1 + _t), fill=WHITE, width=self._lw(2))
++                self._label(d, x1, y2 + self._sz(13), f"FACE {i}  {f.conf:.2f}", WHITE, colour)
+             n_faces = len(det.faces)
+ 
+-        self._label(d, 6, img.height - 6,
++        self._label(d, self._sz(6), img.height - self._sz(6),
+                     f"WIDE  {self._status.wide_fps:4.1f} fps  faces {n_faces}", FG, "#000000")
+         return img
+ 
+@@ -1813,7 +1851,25 @@
+         put("inference ms", f"{st.infer_ms:5.1f}")
+         put("serial RTT ms", f"{link.rtt_ms:5.1f}",
+             RED_HI if link.errors else (GREEN_HI if link.connected else MUTED))
+-        put("pitch / yaw", f"{link.pitch_deg:+7.2f} /{link.yaw_deg:+8.2f}")
++        # THE DEAD-RECKONED POSE, NOT link.pitch_deg -- which is FROZEN for the
++        # whole of a track and so is wrong exactly when someone is watching.
++        # `link.command()` refuses to run while servoing (a second request on
++        # the port contends with the vel stream), and `_note_pose` only runs
++        # inside `command()`, so LinkStatus holds whatever the last blocking
++        # command reported. `SystemStatus.pose` is integrated from the
++        # commanded rates and stays live; ReckonedPose shares LinkStatus's
++        # field names so either can be formatted the same way.
++        #
++        # It DRIFTS, by construction, and it is still the right number to
++        # show: drift is part of what the controller believes, and a stale
++        # reading that looks fresh is worse than a live one that is known to
++        # wander. Marked so the two cannot be confused.
++        dr = self._status.pose
++        src = dr if dr.valid else link
++        put("pitch / yaw",
++            f"{src.pitch_deg:+7.2f} /{src.yaw_deg:+8.2f}"
++            + ("  DR" if dr.valid else "  link"),
++            FG if dr.valid else MUTED)
+         put("pixel error", f"{st.error_px:6.1f} px",
+             GREEN_HI if st.error_px < config.MAX_ERROR_TO_FIRE_PX else AMBER)
+         put("range", f"{st.range_m:5.2f} m  {self._range_source}")

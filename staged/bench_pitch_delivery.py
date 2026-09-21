@@ -94,8 +94,12 @@ _IMUF = re.compile(r"IMUF\s+\S+\s+\S+\s+\S+\s+([-+\d.]+)\s+([-+\d.]+)")
 #: single-motor `vel` would be half pitch and half yaw, which is not the axis
 #: gravity loads. (The brief said "vel on tilt"; this is that question asked of
 #: the payload axis rather than the motor.)
-DEFAULT_RATE = 150.0            # steps/s per motor -> 7.31 deg/s of payload
-DEFAULT_BURST_S = 2.0           # -> 14.6 deg of traverse
+#: 2026-09-20: was 150 steps/s, which is 7.3 deg/s -- nowhere near the ~120
+#: deg/s the tracking loop actually commands, and gravity load is a function of
+#: the torque being asked for. Measured at an operating rate, with the burst
+#: shortened to keep the traverse inside the same envelope.
+DEFAULT_RATE = 1200.0           # steps/s per motor -> 58.5 deg/s of payload
+DEFAULT_BURST_S = 0.4           # -> 23.4 deg of traverse
 DEFAULT_ANGLES = (0.0, -20.0, -40.0)
 
 #: Re-send the rate this often. The firmware watchdog is VEL_WATCHDOG_MS (400)
@@ -286,6 +290,336 @@ def run_leg(link, rate: float, burst_s: float, log):
     }
 
 
+# ==========================================================================
+#   SUSTAINED-RATE SHUTTLE SWEEP  --  rate-limited or heat-limited?
+# ==========================================================================
+#
+# THE QUESTION. MAX_MOTOR_RATE is pinned at 1600 on one observation: in
+# run_2026-09-20_184448 every 5 s window at or below 1607 steps/s delivered
+# ~0.95 of the commanded angle, and the one window at 2468 delivered 0.02. One
+# window is not a threshold, and it does not say WHY. Two mechanisms produce
+# that shape and they have opposite fixes:
+#
+#   a RATE limit   -- the motor cannot follow the step train above some rate.
+#                     Reproduces instantly, identically, every time, and does
+#                     not care how long the axis has been running.
+#   a THERMAL limit -- the driver is backing off its current, or the motor is
+#                     losing torque as it heats. Comes on DURING a leg, gets
+#                     worse the longer the axis runs, and recovers with rest.
+#
+# Separating them is what this sweep is for: delivery is measured at four
+# rates, WITHIN each leg (first half vs second), and the whole set is repeated
+# after REST_S. A rate limit repeats identically; a thermal one comes on
+# sooner and reads worse on the second pass.
+#
+# WHY SHUTTLES AND NOT ONE LONG LEG. The axis has 180 deg of pitch travel and
+# a matched pair at 2400 steps/s crosses all of it in 1.5 s, so a 20 s one-way
+# leg is not slow -- it is impossible, and every leg would be a measurement of
+# the end stop. Each leg therefore accelerates, plateaus, and reverses before
+# the stop, inside SHUTTLE_ENVELOPE_DEG of the datum, and the sweep runs as
+# many legs as it takes to accumulate PLATEAU_TARGET_S of plateau at each rate.
+#
+# WHY MATCHED MOTORS AND NOT ONE. A single motor on a differential is equal
+# parts pitch and yaw, so the payload yaws -- and the IMU rides the payload, so
+# its pitch axis stops being the mechanism's pitch axis the moment yaw moves.
+# That is what voided nine of fifteen windows in run_2026-09-20_184448:
+# per-second "delivery" read up to 410%, which is impossible, because the
+# metric was mixing axes. A MATCHED pair is pure pitch by construction and
+# holds yaw at the datum, which is what makes the reading mean anything. The
+# single-motor checks stay where they belong, in preflight, where a dead axis
+# has to announce itself before any number is taken.
+
+#: Matched rate on BOTH motors, per leg.
+STALL_RATES = (1200, 1600, 2000, 2400)
+
+#: Plateau seconds to accumulate at each rate, per pass. Not a leg count: at
+#: 2400 a leg holds ~0.9 s of plateau and at 1200 ~1.9 s, so a fixed count
+#: would gather twice the evidence at the rate that needs it least.
+PLATEAU_TARGET_S = 20.0
+
+#: Pitch either side of the datum. PITCH_LIMIT_DEG is (-90, +90); 60 leaves
+#: 30 deg of margin for the reversal to arrest in, which at 2400 steps/s and
+#: VEL_ACCEL 40000 microsteps/s^2 takes about 3 deg.
+SHUTTLE_ENVELOPE_DEG = 60.0
+
+#: Rest between the two passes. A thermal limit recovers over this and comes
+#: back SOONER on the second pass; a rate limit reproduces identically and does
+#: not care that the axis was idle.
+REST_S = 120.0
+
+#: Gyro poll period inside a leg. `imu fast` costs ~0.21 s of wall time, but
+#: try_probe DROPS rather than delaying when the vel stream needs the link, so
+#: this cannot starve the watchdog it is measuring against.
+STALL_POLL_S = 0.05
+
+#: Blanking either side of a reversal. VEL_ACCEL is 40000 microsteps/s^2, so
+#: the ramp to 2400 steps/s is 60 ms, and there is another ~2 deg of lash to
+#: take up (wrist-hysteresis-under-gravity-load). Samples inside this window
+#: are PLATEAU-EXCLUDED: they are real, but they are measuring the ramp.
+RAMP_BLANK_S = 0.12
+
+#: `imu fast` prints "IMUF gx gy gz pitch roll" -- the three gyro axes first.
+#: Cheaper than `imu` and already in link.PROBE_COMMANDS, so it yields to the
+#: vel stream instead of queueing in front of it.
+_GYRO = re.compile(r"IMUF\s+([-+\d.]+)\s+([-+\d.]+)\s+([-+\d.]+)")
+_MAG = re.compile(r"MAG\s+-?\d+\s+-?\d+\s+-?\d+\s+[-+\d.]+\s+([-+\d.]+)")
+
+
+def _yaw_now(link):
+    """Payload yaw from the magnetometer, or None. Coarse (~1 deg), and the
+    only absolute yaw this rig has; recorded per leg so a leg that drifted can
+    be thrown out rather than silently averaged in."""
+    m = _MAG.search(link.try_probe("imu mag", timeout=0.8) or "")
+    return float(m.group(1)) if m else None
+
+
+def shuttle_leg(link, rate: float, sign: float, start_deg: float, log):
+    """ONE traverse: ramp, plateau, stop before the envelope. Matched motors.
+
+    A leg is a single crossing, not a sustained back-and-forth, and consecutive
+    legs alternate `sign`. That is what makes the set self-unwinding -- the
+    payload ends each pair back where it started -- and it keeps the reversal
+    OUTSIDE the measurement, where the VEL_ACCEL ramp and the ~2 deg of lash
+    cannot be mistaken for a stall.
+
+    Returns the samples, not a verdict: one leg is about a second, and the rate
+    question is answered by pooling every leg at the same rate.
+
+    SCORED ON |omega|. With yaw held at the datum by the matched pair, the
+    payload's only rotation IS pitch, so the magnitude of the gyro vector is
+    the pitch rate -- without this bench having to know which gyro axis the IMU
+    calls pitch, and with no sign for the alternation to confuse. The per-axis
+    medians are recorded alongside it, so the bench day settles that mapping as
+    a by-product.
+    """
+    pitch_dps = abs(rate) * config.AXIS_STEP_DEG      # matched pair = pure pitch
+    period = 1.0 / VEL_HZ
+    plateau, ramp = [], []
+    pos = float(start_deg)
+    target = math.copysign(SHUTTLE_ENVELOPE_DEG, sign)
+    # Open loop from the commanded rate. If the axis IS stalling the integral
+    # over-estimates travel and ends the leg early -- erring toward the middle
+    # of the envelope, which is the safe direction to be wrong in.
+    t0 = time.perf_counter()
+    last = t0
+    deadline = t0 + SHUTTLE_LEG_MAX_S
+    next_poll = t0
+    r = sign * abs(rate)
+    while True:
+        now = time.perf_counter()
+        if now >= deadline or (pos - target) * sign >= 0.0:
+            break
+        pos += sign * pitch_dps * (now - last)
+        last = now
+        link.send_vel(r, r)
+        if now >= next_poll:
+            m = _GYRO.search(link.try_probe("imu fast", timeout=0.5) or "")
+            if m:
+                g = [float(m.group(i)) for i in (1, 2, 3)]
+                mag = math.sqrt(sum(x * x for x in g))
+                row = (now - t0, mag, g)
+                # The first RAMP_BLANK_S is the VEL_ACCEL ramp and the lash
+                # take-up. Those samples are real, but they measure the ramp.
+                (ramp if now - t0 < RAMP_BLANK_S else plateau).append(row)
+            next_poll = now + STALL_POLL_S
+        time.sleep(min(period, max(0.0, deadline - time.perf_counter())))
+    link.stop()
+    held = time.perf_counter() - t0
+    return {"rate": rate, "commanded_dps": pitch_dps, "sign": sign,
+            "start_deg": start_deg, "end_deg": pos, "held_s": held,
+            "timed_out": held >= SHUTTLE_LEG_MAX_S,
+            "plateau": plateau, "ramp": ramp}
+
+
+#: Hard ceiling on one traverse, so a leg cannot run away if the open-loop
+#: integral is wrong. The longest legitimate traverse is 120 deg at the slowest
+#: rate, 2.1 s; 4 s leaves headroom without letting a runaway last long. A leg
+#: that hits this is FLAGGED, because hitting it means the integral and the
+#: mechanism disagree -- which is itself the stall being looked for.
+SHUTTLE_LEG_MAX_S = 4.0
+
+
+#: Walking the leftover residual back to the datum between rates. Half the
+#: slowest rate under test, so a stall in the unwind can neither be mistaken
+#: for nor hide a stall in the legs it sits between.
+UNWIND_RATE = 600.0
+
+
+def _unwind(link, residual_deg: float):
+    """Return the payload to the datum. Matched pair, so this is pure pitch and
+    leaves yaw where the leg left it."""
+    if abs(residual_deg) <= 1.0:
+        return
+    back = -math.copysign(UNWIND_RATE, residual_deg)
+    secs = abs(residual_deg) / (UNWIND_RATE * config.AXIS_STEP_DEG)
+    _drive(link, back, back, secs)
+    time.sleep(SETTLE_S)
+
+
+def stall_sweep(link, log):
+    """Both passes, with the rest between. Returns a list of per-rate dicts."""
+    out = []
+    for pass_no in (1, 2):
+        if pass_no == 2:
+            log("\nresting %.0f s before the repeat. A thermal limit recovers "
+                "over this and reads WORSE on this pass; a rate limit "
+                "reproduces identically." % REST_S)
+            time.sleep(REST_S)
+        for rate in STALL_RATES:
+            log("\npass %d: matched %d steps/s (%.0f deg/s of pitch), "
+                "traversing +/-%.0f deg until %.0f s of plateau"
+                % (pass_no, rate, rate * config.AXIS_STEP_DEG,
+                   SHUTTLE_ENVELOPE_DEG, PLATEAU_TARGET_S))
+            pads = _pads_line(link)
+            y0, t0 = _yaw_now(link), read_tilt(link, 7)
+            got, legs, plateau, ramp, timeouts = 0.0, 0, [], [], 0
+            pos, sign = 0.0, -1.0          # start downward; gravity assists
+            while got < PLATEAU_TARGET_S:
+                leg = shuttle_leg(link, float(rate), sign, pos, log)
+                legs += 1
+                timeouts += 1 if leg["timed_out"] else 0
+                plateau.extend(leg["plateau"])
+                ramp.extend(leg["ramp"])
+                got += len(leg["plateau"]) * STALL_POLL_S
+                pos = leg["end_deg"]
+                sign = -sign               # alternate: the set unwinds itself
+                time.sleep(SETTLE_S)
+                if legs > 60:
+                    log("   60 legs without reaching the target -- the IMU is "
+                        "answering too rarely to finish this rate.")
+                    break
+            _unwind(link, pos)             # back to the datum for the next rate
+            y1, t1 = _yaw_now(link), read_tilt(link, 7)
+            r = _score(rate, plateau, ramp, legs, got)
+            if r is None:
+                log("   no plateau samples -- rate discarded.")
+                continue
+            r.update({"pass": pass_no, "pads": pads, "timeouts": timeouts,
+                      "yaw_before": y0, "yaw_after": y1,
+                      "tilt_before": t0, "tilt_after": t1})
+            out.append(r)
+            dy = (None if y0 is None or y1 is None else y1 - y0)
+            log("   %d legs, %.0f s of plateau: commanded %.0f deg/s, "
+                "measured %.0f -> delivery %.2f (1st half %.2f, 2nd %.2f)%s"
+                % (legs, got, r["commanded_dps"], r["measured_dps"],
+                   r["delivery"], r["first_half"], r["last_half"],
+                   "" if dy is None else "; yaw moved %+.1f deg" % dy))
+            if timeouts:
+                log("   %d of %d legs hit the %.0f s ceiling: the commanded "
+                    "traverse did not arrive, which is the stall itself."
+                    % (timeouts, legs, SHUTTLE_LEG_MAX_S))
+            if dy is not None and abs(dy) > 5.0:
+                log("   YAW MOVED %+.1f deg on a matched pair, which should be "
+                    "pure pitch. One motor is not keeping up, so this rate's "
+                    "number is about that, not about a rate or a temperature."
+                    % dy)
+    return out
+
+
+def _pads_line(link):
+    """`pads` in one line, per leg: an axis that lost its STEP pad to SIO counts
+    steps it never emits, and would read as a total stall at every rate."""
+    try:
+        return " ".join((link.command("pads", timeout=5.0) or "").split())
+    except Exception:                                      # noqa: BLE001
+        return ""
+
+
+def _score(rate, plateau, ramp, legs, got_s):
+    if not plateau:
+        return None
+    want = abs(rate) * config.AXIS_STEP_DEG
+    mags = sorted(p[1] for p in plateau)
+    med = mags[len(mags) // 2]
+    half = len(plateau) // 2
+    first = statistics.median([p[1] for p in plateau[:half]]) if half else float("nan")
+    last = statistics.median([p[1] for p in plateau[half:]]) if half else float("nan")
+    axes = [statistics.median([p[2][i] for p in plateau]) for i in range(3)]
+    return {"rate": rate, "legs": legs, "plateau_s": got_s,
+            "n_plateau": len(plateau), "n_ramp": len(ramp),
+            "commanded_dps": want, "measured_dps": med,
+            "delivery": med / want if want else float("nan"),
+            "first_half": first / want if want else float("nan"),
+            "last_half": last / want if want else float("nan"),
+            "gyro_axis_medians": axes}
+
+
+def report_stall(rows, log):
+    if not rows:
+        return
+    log("")
+    log("%-5s %6s %8s %9s %9s %9s %8s" %
+        ("pass", "rate", "legs", "delivery", "1st half", "2nd half", "yaw"))
+    for r in sorted(rows, key=lambda x: (x["rate"], x["pass"])):
+        dy = (float("nan") if r["yaw_before"] is None or r["yaw_after"] is None
+              else r["yaw_after"] - r["yaw_before"])
+        log("%-5d %6d %8d %9.2f %9.2f %9.2f %8.1f"
+            % (r["pass"], r["rate"], r["legs"], r["delivery"],
+               r["first_half"], r["last_half"], dy))
+    log("")
+    log("READING IT:")
+    log("  delivery falls with RATE and pass 2 matches pass 1  -> RATE limit;")
+    log("    set MAX_MOTOR_RATE to the highest rate still at ~0.95.")
+    log("  delivery falls WITHIN a leg (2nd half < 1st) and is")
+    log("    WORSE on pass 2 at the same rate                  -> THERMAL;")
+    log("    raising MAX_MOTOR_RATE would work cold and fail in a long track.")
+    log("  delivery flat at ~0.95 at every rate                -> NEITHER, and")
+    log("    MAX_MOTOR_RATE 1600 is leaving travel on the table. The 184448")
+    log("    collapse would then be the firmware pitch clamp, as the trace says.")
+    p1 = {r["rate"]: r for r in rows if r["pass"] == 1}
+    p2 = {r["rate"]: r for r in rows if r["pass"] == 2}
+    both = sorted(set(p1) & set(p2))
+    if both:
+        drop = [p1[k]["delivery"] - p2[k]["delivery"] for k in both]
+        log("")
+        log("  pass1 - pass2 by rate: %s"
+            % ", ".join("%d: %+.2f" % (k, d) for k, d in zip(both, drop)))
+        log("  (all near 0 -> repeatable, i.e. a rate limit. Systematically "
+            "positive -> the axis is still warm, i.e. thermal.)")
+
+
+def _run_stall(a) -> int:
+    """The shuttle sweep, with the same preflight and cleanup as the angle legs.
+    Preflight is not optional: a dead axis reads 0.00 delivery at every rate,
+    which is indistinguishable from the stall this is looking for."""
+    from turret_host.link import TurretLink
+    link = TurretLink().start()
+    log = lambda s: print(s, flush=True)                   # noqa: E731
+    rows = []
+    try:
+        if not preflight(link, log):
+            log("\nPREFLIGHT FAILED -- not benching. A dead axis reads 0.00 "
+                "delivery at every rate, which is exactly what a stall reads "
+                "like, and this sweep could not tell them apart.")
+            return 2
+        input("\n    level the payload by hand, clear +/-%.0f deg of arc, and "
+              "press Enter (Ctrl-C to stop): " % SHUTTLE_ENVELOPE_DEG)
+        rows = stall_sweep(link, log)
+        report_stall(rows, log)
+    except KeyboardInterrupt:
+        log("\ninterrupted.")
+        report_stall(rows, log)
+    finally:
+        try:
+            link.stop()
+            link.command("velmode off", timeout=3.0)
+        except Exception:                                  # noqa: BLE001
+            pass
+        link.close()
+    if a.out and rows:
+        with open(a.out, "w", encoding="utf-8") as fh:
+            json.dump({"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                       "kind": "shuttle_stall_sweep",
+                       "rates": list(STALL_RATES),
+                       "plateau_target_s": PLATEAU_TARGET_S,
+                       "envelope_deg": SHUTTLE_ENVELOPE_DEG,
+                       "rest_s": REST_S,
+                       "axis_step_deg": config.AXIS_STEP_DEG,
+                       "rows": rows}, fh, indent=2)
+        print("wrote %s" % a.out)
+    return 0 if rows else 3
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--angles", type=float, nargs="+", default=list(DEFAULT_ANGLES),
@@ -297,10 +631,44 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="print the plan and the numbers it depends on; open "
                          "no port and move nothing")
+    ap.add_argument("--stall", action="store_true",
+                    help="the shuttle sweep instead of the delivery legs: "
+                         "matched motors at %s steps/s, %.0f s of plateau at "
+                         "each, twice, with a %.0f s rest between, to separate "
+                         "a rate limit from a thermal one"
+                         % (list(STALL_RATES), PLATEAU_TARGET_S, REST_S))
     a = ap.parse_args(argv)
 
     dps = a.rate * config.AXIS_STEP_DEG
     sweep = dps * a.burst
+    if a.stall:
+        print("shuttle sweep: matched motors (pure pitch, yaw held at the "
+              "datum), shuttling +/-%.0f deg." % SHUTTLE_ENVELOPE_DEG)
+        print("       AXIS_STEP_DEG %.5f  watchdog %d ms  gyro poll %.2f s  "
+              "ramp blanked %.0f ms"
+              % (config.AXIS_STEP_DEG, config.VEL_WATCHDOG_MS, STALL_POLL_S,
+                 1000 * RAMP_BLANK_S))
+        print("       a one-way leg is impossible: %d steps/s crosses the "
+              "whole %.0f deg of pitch travel in %.1f s."
+              % (STALL_RATES[-1], config.PITCH_LIMIT_DEG[1] - config.PITCH_LIMIT_DEG[0],
+                 (config.PITCH_LIMIT_DEG[1] - config.PITCH_LIMIT_DEG[0])
+                 / (STALL_RATES[-1] * config.AXIS_STEP_DEG)))
+        total = 0.0
+        for rate in STALL_RATES:
+            dps = rate * config.AXIS_STEP_DEG
+            leg_s = 2 * SHUTTLE_ENVELOPE_DEG / dps
+            per_leg = max(0.0, leg_s - RAMP_BLANK_S)
+            legs = math.ceil(PLATEAU_TARGET_S / per_leg) if per_leg > 0 else 0
+            total += legs * (leg_s + SETTLE_S)
+            print("       %5d steps/s -> %5.1f deg/s of pitch, %4.1f s per "
+                  "traverse (%4.1f s of plateau), ~%2d legs for %.0f s"
+                  % (rate, dps, leg_s, per_leg, legs, PLATEAU_TARGET_S))
+        print("       2 passes + %.0f s rest = about %.0f min."
+              % (REST_S, (2 * total + REST_S) / 60.0))
+        if a.dry_run:
+            print("\n--dry-run: nothing opened, nothing moved.")
+            return 0
+        return _run_stall(a)
     print("bench: %.0f steps/s on BOTH motors = %.2f deg/s of payload pitch; "
           "%.1f s burst = %.1f deg per leg" % (a.rate, dps, a.burst, sweep))
     print("       AXIS_STEP_DEG %.5f  DIFFERENTIAL_N %.4f  watchdog %d ms"

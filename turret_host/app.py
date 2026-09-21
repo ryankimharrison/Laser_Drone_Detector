@@ -85,6 +85,7 @@ from turret_host.camera_fusion import WideToNarrow                # noqa: E402
 # and silently writing no step_check.json at all. It is safe here: unlike
 # `cameras` it pulls only stdlib and turret_host.config, no cv2, no torch.
 from turret_host import step_integrity                             # noqa: E402
+from turret_host.flowvel import FlowVelocity                       # noqa: E402
 
 #: `imu fast` -> "IMUF gx gy gz pitch roll". Groups 4 and 5 are the angles.
 _IMUF_RE = re.compile(r"IMUF\s+([-+\d.]+)\s+([-+\d.]+)\s+([-+\d.]+)\s+"
@@ -95,7 +96,9 @@ from turret_host.types import (                                   # noqa: E402
     DetectionResult,
     Frame,
     LaserState,
+    AttitudeStatus,
     LinkStatus,
+    ReckonedPose,
     Slot,
     SystemStatus,
     TrackEstimate,
@@ -133,6 +136,12 @@ _EST_STALL_S = 0.250   # 2026-09-20: was 0.100, which assumed 30 Hz frames. The 
 # ~40 s; this is that plus margin for a single blocking command in flight, and
 # it is a bound on how long the window takes to close.
 _PLATFORM_JOIN_S = 6.0
+#: How long shutdown will wait for the closing re-home. A full home measures
+#: ~40 s (35.9 s on the first real run), and `level` alone can iterate for a
+#: while on a rig that is settling, so this is roughly 2x the expected worst
+#: case. Finite because a window-close must not be holdable hostage by a rig
+#: that has stopped answering.
+_CLOSING_HOME_BUDGET_S = 90.0
 
 # Exposure setpoint, DirectShow log2-seconds. config.py has no exposure
 # constant and cameras.lock_exposure() deliberately leaves it to the caller:
@@ -180,8 +189,8 @@ ATTITUDE_MAX_DEG = 85.0   # 2026-09-20 operator: 60 -> 85 (mechanical stop is +/
 # ATTITUDE_REVERSE_MIN_RATE on the faster motor, at most 600 steps/s) until gravity
 # says the payload is ATTITUDE_REVERSE_HYST_DEG back inside, then resume tracking.
 ATTITUDE_REVERSE_S = 1.0
-ATTITUDE_REVERSE_MIN_RATE = 200.0
-ATTITUDE_REVERSE_HYST_DEG = 5.0
+ATTITUDE_REVERSE_MIN_RATE = 600.0   # 2026-09-20 run_203933: reverse at 200..600 recovered only 8 deg from 86; a 1600-rate excursion needs a 1600-rate reverse
+ATTITUDE_REVERSE_HYST_DEG = 10.0    # reverse starts at 75 (limit 85 stays, Ryan's number); 5 deg was not enough margin at 48 deg/s
 
 #: A measured attitude older than this is not evidence about now, and the
 #: guard falls back to the dead-reckoned one. Two sample periods at 10 Hz.
@@ -203,6 +212,11 @@ ATTITUDE_FAIL_LIMIT = 3
 #: missing sensor costs nothing, short enough that reseating a connector is
 #: noticed without a restart.
 ATTITUDE_BACKOFF_S = 10.0
+
+#: Datum tilt off the yaw axis above which the pose overlay says so. Set just
+#: under the 4.4 deg the bench actually measured on 2026-09-18, so the
+#: condition is reported rather than silently degrading the display.
+POSE_BASE_TILT_WARN_DEG = 3.0
 
 
 def _now() -> float:
@@ -268,6 +282,7 @@ class SyntheticSource(threading.Thread):
         self.fps = 0.0
         self.frames = 0
         self.failed_grabs = 0
+        self.duplicates_dropped = 0  # synthetic frames are always newly generated
         self.max_gap_ms = 0.0
         self.error: Optional[str] = None
 
@@ -595,6 +610,9 @@ class TurretApp:
     """Owns every thread and every handle, and gives all of them back."""
 
     def __init__(self, args):
+        from turret_host.microstepping import configure
+        configure(getattr(args, "microstep", None) or 16,
+                  dynamic=getattr(args, "dynamic_microstep", False))
         self.args = args
         self.sim = bool(args.no_hardware)
         # Flight recorder, or None. Set up in startup() once the link exists;
@@ -611,17 +629,36 @@ class TurretApp:
 
         # -- hand-offs ---------------------------------------------------
         self.narrow_slot = Slot()
+        #: Last flow velocity and which tier produced it, handed from the
+        #: detect thread to the control thread. Plain assignment of a tuple is
+        #: atomic enough here: the control thread wants the most recent value
+        #: and a one-frame-old one is not a fault.
+        self._ff_velocity = (0.0, 0.0)
+        self._ff_source = "none"
+        self._ff_points = 0
+        self._ff_ms = 0.0
         self.wide_slot = Slot()
         self.det_slot = Slot()          # DetectedFrame, narrow
         # Wide detections now reach the TRACKER as a fallback, not just the
         # display -- see _tracker_loop. They still never gate the beam.
         self.wide_det_slot = Slot()     # DetectedFrame, wide (display + fallback)
         self._w2n = WideToNarrow.load()
+        #: Target image velocity for the FEEDFORWARD only, from optical flow on
+        #: the box patch. Lives on the detect thread, which is the only place
+        #: the raw narrow frame and the box exist together. See flowvel.py.
+        self.flowvel = FlowVelocity()
+
         # Measured attitude, from gravity. (t, pitch_deg, roll_deg).
         self.attitude_slot = Slot()
         # Unit gravity vector at the datum, captured when homing completes.
         # None until then -- the guard is inert without a reference.
         self._tilt_datum = None
+        # Pose overlay: (t, pitch) of the last smoothed measurement, the
+        # one-shot sign-check latch, and the base tilt measured at the datum.
+        self._pose_filt = (0.0, None)
+        self._pose_scale: list = []
+        self._pose_scale_warned = False
+        self._base_tilt_deg = None
         self._attitude_tripped = False
         self._cmd_hist: collections.deque = collections.deque(maxlen=120)   # (t, rate_a, rate_b) sent
         self._reverse_rates = (0.0, 0.0)
@@ -721,6 +758,13 @@ class TurretApp:
         """
         try:
             self._start_link()
+            if not self.sim and (getattr(self.args, "microstep", None) is not None
+                                 or config.DYNAMIC_MICROSTEPPING):
+                from turret_host.microstepping import apply_to_board
+                profile = apply_to_board(self.link, config.MICROSTEP_DIVISOR,
+                                         dynamic=config.DYNAMIC_MICROSTEPPING)
+                self.log("microstep profile: %s; narrow angular cap %.2f deg/s" %
+                         (profile, config.MAX_MOTOR_RATE * config.AXIS_STEP_DEG))
             self._start_telemetry()
             # HOMING FIRST, BEFORE THE CAMERAS AND MODELS.
             #
@@ -752,6 +796,13 @@ class TurretApp:
             except Exception as e:                       # noqa: BLE001
                 self._step_datum = None
                 self.log("step check: datum failed (%s)" % e, "warn")
+            # Homing and datum capture are finished and no setup command owns
+            # the serial request/reply stream. Only now may the recorder issue
+            # opportunistic `imu fast` probes. Starting it before homing can
+            # cross the replies: homing's `state` receives an `IMUF ...` line
+            # and aborts even though both commands individually succeeded.
+            if self.recorder is not None and not self.sim:
+                self.recorder.enable_imu(self.link)
             self._start_cameras()
             self._load_models()
             self._freeze_gc()
@@ -808,10 +859,12 @@ class TurretApp:
     def _start_telemetry(self) -> None:
         """Open the flight recorder if --record was given.
 
-        Started right after the link so the IMU stream also covers homing,
-        and before the cameras so no tracked frame is missed. Sampling the
-        board while it servos is normally forbidden -- see link.try_probe for
-        why this particular path is allowed to.
+        Files and image-writer threads start right after the link so no tracked
+        frame is missed. Board IMU probing is deliberately deferred until
+        homing and datum capture finish; they share one serial request/reply
+        stream and must not race a background probe. Once tracking can start,
+        sampling uses link.try_probe so a busy vel stream drops telemetry
+        instead of being delayed.
         """
         if not getattr(self.args, "record", None):
             return
@@ -820,7 +873,7 @@ class TurretApp:
         if out.is_dir() or not out.suffix:
             out = out / time.strftime("run_%Y-%m-%d_%H%M%S")
         self.recorder = FlightRecorder(
-            out, link=None if self.sim else self.link,
+            out, link=None,
             imu_hz=float(self.args.record_imu_hz),
             on_message=lambda m: self.log(m, "warn"),
         ).start()
@@ -1064,13 +1117,29 @@ class TurretApp:
 
             from turret_host.homing import Homing, PITCH_VERIFY_TOL_DEG
 
+            if getattr(self.args, "fast_home", False):
+                self.log("--fast-home is no longer supported and is being "
+                         "IGNORED: it skipped the magnetometer sweep, which "
+                         "is the only absolute yaw reference on this machine. "
+                         "Running the full home.", "warn")
+
             self.progress("homing: this takes tens of seconds and moves the "
                           "platform", 0.0)
             seq = Homing(self.link, self.gui.progress_callback("HOMING")
                          if self.gui is not None
                          else (lambda text, frac=None: self.progress(text, frac)),
+                         # None means "load the stored reference from disk",
+                         # which homing.py now does by default. That file has
+                         # existed since 2026-09-19 and was never read,
+                         # because the only way in was typing the float on the
+                         # command line -- so every run swept the motor field
+                         # for 20 s and threw the datum away.
                          yaw_reference_lsb=self.args.yaw_reference,
-                         fast=getattr(self.args, 'fast_home', False),
+                         # fast= is gone. The magnetometer sweep is the only
+                         # absolute yaw reference this machine has and it runs
+                         # every time now; homing.py refuses fast outright.
+                         # A stale --fast-home is reported and ignored rather
+                         # than allowed to fail the whole startup.
                          skip_level=getattr(self.args, 'skip_level', False),
                          # Polled between commands so shutdown() can stop a
                          # 40 s sequence that is holding the link's io lock.
@@ -1106,8 +1175,32 @@ class TurretApp:
             # the rewind returns to 3 deg, and the check reports "the payload
             # returned" while dead reckoning is 3 deg wrong from the first
             # frame. A reference that is not verified is not a reference.
-            self._datum_level_ok = bool(result.pitch_datum_ok)
+            #
+            # AND the post-sethome re-measurement now gates it too. The
+            # preload check above runs BEFORE dzero/sethome, so it answers
+            # "did the preload come back", not "is the datum we wrote level".
+            # Both have to hold.
+            self._datum_level_ok = bool(result.pitch_datum_ok
+                                        and result.datum_verified)
             self._datum_pitch_deg = float(result.pitch_tilt_deg)
+            if not result.datum_verified:
+                self.log("datum NOT verified after sethome: %.2f deg from "
+                         "vertical. See the homing log above for whether that "
+                         "is pitch (re-homing may fix it) or roll (`level` "
+                         "cannot correct roll -- level the rig by hand)."
+                         % result.datum_residual_deg, "error")
+            if result.ref_source == "none":
+                self.log("yaw came up ARBITRARY this run: no stored reference. "
+                         "One has just been saved, so the NEXT home will be "
+                         "absolute.", "warn")
+            else:
+                self.log("yaw reference %s -- the magnetometer sweep produced "
+                         "an absolute datum." % result.ref_source, "good")
+            if result.soft_limit_margin_deg:
+                self.log("measured soft-limit room from this datum: %s"
+                         % ", ".join("%s %.1f deg" % (k, v) for k, v in
+                                     sorted(result.soft_limit_margin_deg.items())),
+                         "good")
             if not self._datum_level_ok:
                 self.log("DATUM NOT AT IMU ZERO: gravity reads %+.2f deg after "
                          "homing (tolerance %.2f). Dead reckoning, the travel "
@@ -1398,7 +1491,7 @@ class TurretApp:
         item, _seq = self.attitude_slot.get()
         if item is None:
             return None
-        t, pitch, roll = item
+        t, pitch, roll = item[0], item[1], item[2]
         age = now - t
         if not 0.0 <= age <= ATTITUDE_MAX_AGE_S:
             return None
@@ -1418,12 +1511,137 @@ class TurretApp:
         item, _seq = self.attitude_slot.get()
         if item is None:
             return None
-        t, pitch, roll = item
+        t, pitch, roll = item[0], item[1], item[2]
         age = now - t
         if not 0.0 <= age <= ATTITUDE_MAX_AGE_S:
             return None
         return (self._angle_between(self._gravity_unit(pitch, roll),
                                     (0.0, 0.0, 1.0)), age)
+
+    # -- the pose overlay's solid model --------------------------------
+    def _measured_pitch(self, ghost_pitch_deg: float, now: float):
+        """`AttitudeStatus` for the pose overlay: where the payload really is.
+
+        **Magnitude is measured, sign is not.** The magnitude is the angle
+        between the gravity vector now and the gravity vector at the datum --
+        a pure angle between two measured vectors, assuming nothing about how
+        the GY-85 is clocked on its plate. The sign comes from the ghost.
+
+        Taking the sign from the ghost is a real limitation and it is stated
+        in the HUD. It costs one blind spot: a payload sitting at the exact
+        mirror of its commanded pitch reads as agreement. Nothing else does --
+        backlash, lost steps, slip and a hand on the head all change the
+        magnitude, and the magnitude is what the display is watching. The
+        alternative needs the sensor's clocking about the yaw axis, which has
+        never been measured; guessing it would put a fifth unverified sign
+        constant into a project that has shipped four. What CAN be checked
+        independently is the magnitude -- see `_check_pose_scale`.
+
+        **There is no complementary filter here, and §3 of the brief asked for
+        one.** The reason is the same: a filter needs the gyro's pitch axis in
+        the payload frame, the ITG3205 and the ADXL345 are separate parts with
+        independent axis conventions on the GY-85, and that mapping has never
+        been checked. A wrong gyro sign does not look like noise -- it
+        fabricates smooth, confident motion in the wrong direction, which is
+        strictly worse than the wobble it removes. So the gyro is used only
+        for its MAGNITUDE, which no mounting convention can corrupt, to mark
+        the accelerometer untrustworthy while the head is moving. To do better,
+        measure the mapping: command a slow pure-pitch move and regress the
+        three gyro axes against d(tilt)/dt.
+        """
+        item, _seq = self.attitude_slot.get()
+        if item is None or self._tilt_datum is None:
+            return AttitudeStatus(ok=False, note="no attitude datum")
+        t, p_imu, r_imu = item[0], item[1], item[2]
+        gyro = item[3] if len(item) > 3 else (0.0, 0.0, 0.0)
+        age = now - t
+        if not 0.0 <= age <= ATTITUDE_MAX_AGE_S:
+            return AttitudeStatus(ok=False, age_s=max(0.0, age), roll_deg=r_imu,
+                                  note="attitude stale")
+
+        mag = self._angle_between(self._gravity_unit(p_imu, r_imu), self._tilt_datum)
+        rate = math.sqrt(sum(float(g) ** 2 for g in gyro))
+        moving = rate > config.POSE_STILL_RATE_DPS
+        prev_t, prev = self._pose_filt
+
+        # THIS IS CALLED FASTER THAN THE SAMPLES ARRIVE. `_publish_status` runs
+        # at the control loop's ~30 Hz and `attitude_slot` refills at
+        # ATTITUDE_SAMPLE_HZ = 10, so the same reading is normally seen three
+        # times. Re-filtering it would drag the state towards the raw value
+        # three times per sample (and re-running the scale check would count it
+        # three times), so a repeat is returned unchanged.
+        if prev is not None and t == prev_t:
+            return AttitudeStatus(ok=True, pitch_deg=prev, roll_deg=r_imu,
+                                  age_s=age, moving=moving, rate_dps=rate,
+                                  scale=self.pose_scale())
+
+        pitch = (-1.0 if ghost_pitch_deg < 0.0 else 1.0) * mag
+        # Exponential smoothing at the interval we actually got, not the one we
+        # asked for: try_probe DROPS a sample rather than delay a motor
+        # command, so the spacing is irregular by design.
+        if prev is not None and 0.0 < (t - prev_t) < 1.0:
+            a = math.exp(-(t - prev_t) / max(1e-3, config.POSE_SMOOTH_TAU_S))
+            pitch = a * prev + (1.0 - a) * pitch
+        self._pose_filt = (t, pitch)
+
+        # Once per SAMPLE, and only while the accelerometer means anything.
+        if not moving:
+            self._check_pose_scale(pitch, ghost_pitch_deg)
+        return AttitudeStatus(ok=True, pitch_deg=pitch, roll_deg=r_imu, age_s=age,
+                              moving=moving, rate_dps=rate,
+                              scale=self.pose_scale())
+
+    def _check_pose_scale(self, measured: float, ghost: float) -> None:
+        """Track measured tilt per commanded degree, and say when it is off.
+
+        THE SIGN CANNOT BE CHECKED HERE and an earlier draft of this pretended
+        it could: `_measured_pitch` takes the sign from the ghost, so a
+        measured-vs-commanded sign comparison compares the ghost with itself
+        and can never fail. What IS independent is the MAGNITUDE, so that is
+        what this watches.
+
+        The ratio is the number AGENT_HANDOFF.md 472 records as 1.072 and
+        calls a confirmation of the kinematics. It is not one. Three
+        measurements of the same quantity exist -- 1.171 (PLAN.md, 2.0 deg
+        probe), 1.072 (`level`), 0.972 (homing, a larger probe) -- and a true
+        scale error is a constant multiplier that cannot produce a 20 % spread.
+        The trend is monotonic in probe size, which is the signature of an
+        ADDITIVE offset, and 0.65-2.3 deg of measured backlash against a 2 deg
+        probe is exactly that size.
+
+        So the ratio is worth measuring properly and has never been measured
+        properly. This does it continuously, from angles far enough out that
+        lash is a small fraction of the probe -- which is the one-way, large-
+        angle measurement that is not blind to scale. `AXIS_STEP_DEG` is
+        derived from `DIFFERENTIAL_N` rather than measured, so if N is wrong
+        every angle in the system is wrong together and no internal check can
+        see it. This one is external: it comes off gravity.
+        """
+        lim = config.POSE_SCALE_MIN_DEG
+        if abs(ghost) < lim or abs(measured) < lim:
+            return
+        self._pose_scale.append(abs(measured) / abs(ghost))
+        if len(self._pose_scale) > config.POSE_SCALE_WINDOW:
+            self._pose_scale.pop(0)
+        if len(self._pose_scale) < config.POSE_SCALE_WINDOW or self._pose_scale_warned:
+            return
+        k = sorted(self._pose_scale)[len(self._pose_scale) // 2]
+        if abs(k - 1.0) > config.POSE_SCALE_TOL:
+            self._pose_scale_warned = True
+            self.log("POSE OVERLAY: the payload is measuring %.3f deg of real "
+                     "tilt per commanded degree, over %d samples past %.0f deg. "
+                     "That is a SCALE error, not backlash -- lash is additive "
+                     "and shrinks as a fraction of a larger angle. DIFFERENTIAL_N "
+                     "(%.4f) is the only unmeasured constant it could come from, "
+                     "and AXIS_STEP_DEG is derived from it, so every logged angle "
+                     "is wrong by the same factor."
+                     % (k, len(self._pose_scale), lim, config.DIFFERENTIAL_N), "warn")
+
+    def pose_scale(self):
+        """Median measured-per-commanded tilt ratio, or None if not enough yet."""
+        if len(self._pose_scale) < 5:
+            return None
+        return sorted(self._pose_scale)[len(self._pose_scale) // 2]
 
     def _capture_tilt_datum(self) -> None:
         """Record the attitude homing just established as the reference."""
@@ -1458,6 +1676,31 @@ class TurretApp:
                  "motion refused past %.0f deg from here, measured by gravity."
                  % (pitch, roll, ATTITUDE_MAX_DEG), "good")
 
+        # How far the datum sits from the payload's own yaw axis -- which the
+        # CAD puts parallel to the GY-85's board normal (sensor +Z) to within
+        # 0.3 deg, so this angle is the TURRET's tilt on its bench, not a
+        # sensor artifact.
+        #
+        # It matters to the pose overlay specifically. Yawing the head sweeps
+        # gravity around a cone of this half-angle, so the overlay's measured
+        # pitch -- an angle from the datum vector -- picks up a yaw-dependent
+        # error. That error is SECOND ORDER, not first: worst case it is
+        # beta^2 / (2 * pitch), in degrees, which for beta = 4.4 is 0.97 deg at
+        # 10 deg of payload pitch, 0.29 at 30 and 0.17 at 45. So it is worst
+        # near level, where the backlash it might be confused with is also
+        # smallest (0.65 deg), and it shrinks as the payload pitches -- the
+        # opposite dependence to a scale error, which is how the two are told
+        # apart. Levelling the base removes it; nothing in software can.
+        self._base_tilt_deg = self._angle_between(self._tilt_datum, (0.0, 0.0, 1.0))
+        if self._base_tilt_deg > POSE_BASE_TILT_WARN_DEG:
+            self.log("pose overlay: the datum is %.1f deg off the yaw axis, so "
+                     "the base is not level. The measured pitch picks up up to "
+                     "%.2f deg of yaw-dependent error at 10 deg of payload pitch "
+                     "(less as it pitches further). Comparable to the backlash "
+                     "near level; level the base to read small gaps there."
+                     % (self._base_tilt_deg, self._base_tilt_deg ** 2 / 20.0),
+                     "warn")
+
     def _attitude_loop(self) -> None:
         """Sample measured attitude while servoing, yielding to the vel stream.
 
@@ -1487,8 +1730,14 @@ class TurretApp:
                         self.log("attitude sampling resumed.", "good")
                         complained = False
                     fails = 0
+                    # Gyro appended as a fourth element. The two existing
+                    # consumers (tilt_from_datum, tilt_from_vertical) slice the
+                    # first three, so this cannot reach them. It is here for
+                    # the pose overlay's `moving` flag, which needs only |w|.
                     self.attitude_slot.put((_now(), float(m.group(4)),
-                                            float(m.group(5))))
+                                            float(m.group(5)),
+                                            (float(m.group(1)), float(m.group(2)),
+                                             float(m.group(3)))))
                 elif reply and "error" in reply.lower():
                     # The BOARD refused, which means the sensor is gone.
                     # Anything other than backing off makes it worse.
@@ -1560,7 +1809,16 @@ class TurretApp:
             # See config.WIDE_FALLBACK_AFTER_MISSES: a live track coasts through
             # a short narrow dropout instead of taking a wide box.
             _need = int(getattr(config, "WIDE_FALLBACK_AFTER_MISSES", 0) or 0)
+            # 2026-09-20 run_183021: this gate BLOCKED THE COARSE PHASE. With the
+            # tracker in ACQUIRE on a wide box, wide was allowed again only
+            # after WIDE_FALLBACK_AFTER_MISSES (3) misses, which is exactly
+            # ACQUIRE_MISSES (3), so every approach was one wide box, three
+            # misses, SEARCH, repeat: 62 three-frame stints, a command on 59%
+            # of rows, and the head never closed a 33 deg gap. The gate is for a
+            # NARROW-sourced track coasting through a dropout; while a coarse
+            # approach is live (_coarse_t0 set) the wide box IS the track.
             _wide_ok = (self.tracker.state is TrackState.SEARCH
+                        or self._coarse_t0 is not None
                         or getattr(self.tracker, "_misses", 0) >= _need)
 
             if targets:
@@ -1588,6 +1846,35 @@ class TurretApp:
                 # actually goes out.
                 est = self.tracker.update(item.result.targets,
                                           item.result.frame_t)
+                # FLOW GOES HERE, NOT IN THE CONTROL THREAD.
+                #
+                # This is the only point that has the RAW narrow frame and the
+                # box for the same instant. `item.frame.image` is the
+                # unannotated capture -- the display overlay is drawn later,
+                # onto a copy, and tracking the overlay would feed the loop its
+                # own output. Measured cost 2.78 ms median (cropped LK), inside
+                # the 33 ms frame period alongside the 10.7 ms detector.
+                # A flow failure is a lost feedforward sample, never a lost
+                # detect thread: with FEEDFORWARD_GAIN at 0 it is inert, and
+                # even at gain 1 "pure P this frame" is the designed fallback.
+                try:
+                    ffv = self.flowvel.update(
+                        item.frame.image if item.frame is not None else None,
+                        (est.box.x1, est.box.y1, est.box.x2, est.box.y2)
+                        if est.box is not None else None,
+                        item.result.frame_t)
+                    self._ff_velocity = ffv
+                    self._ff_source = self.flowvel.source
+                    self._ff_points = self.flowvel.points
+                    self._ff_ms = self.flowvel.ms
+                except Exception as exc:                      # noqa: BLE001
+                    if not getattr(self, "_flow_complained", False):
+                        self._flow_complained = True
+                        self.log(f"flow velocity failed ({exc!r}); feedforward "
+                                 "source is 'none' until it recovers", "warn")
+                    self._ff_velocity = (0.0, 0.0)
+                    self._ff_source = "none"
+                    self._ff_points = 0
             else:
                 # Detections are NOT fed to the filter before the operator
                 # presses START. Otherwise the banner reads TRACK during the
@@ -1597,6 +1884,13 @@ class TurretApp:
                 if self.tracker.state is not TrackState.SEARCH:
                     self.tracker.reset()
                 est = self.tracker.predict_to(item.result.frame_t)
+                # Not tracking: drop the flow history too, so a velocity
+                # measured before START cannot survive into the first
+                # commanded frame.
+                self.flowvel.reset()
+                self._ff_velocity = (0.0, 0.0)
+                self._ff_source = "none"
+                self._ff_points = 0
             self.est_slot.put(TrackedFrame(frame=item.frame, result=item.result,
                                            estimate=est))
 
@@ -1731,7 +2025,7 @@ class TurretApp:
                         ba, bb = -self._cmd_hist[-1][1], -self._cmd_hist[-1][2]
                         peak = max(abs(ba), abs(bb))
                     if peak > 0.0:
-                        f = min(600.0 / peak, max(1.0, ATTITUDE_REVERSE_MIN_RATE / peak))
+                        f = min(1500.0 / peak, max(1.0, ATTITUDE_REVERSE_MIN_RATE / peak))
                         ba, bb = ba * f, bb * f
                     self._reverse_rates = (ba, bb)
                     self.log("ATTITUDE REVERSE: undoing the last %.1f s of "
@@ -1799,7 +2093,14 @@ class TurretApp:
                 if self.controller.ready:
                     out = self.controller.compute(
                         est, now,
-                        pose=self._pose if pose_trusted else None)
+                        pose=self._pose if pose_trusted else None,
+                        # The feedforward's velocity, from optical flow on the
+                        # box patch rather than from differencing box centres.
+                        # `est` still supplies the aim point and everything
+                        # else; this replaces the feedforward term alone.
+                        ff_velocity=self._ff_velocity,
+                        ff_source=self._ff_source,
+                        ff_points=self._ff_points)
                     # WIDE-SOURCED SLEW CAP -- see config.WIDE_MAX_MOTOR_RATE.
                     # The handoff box is stale and coarse; approach at a rate
                     # the narrow camera can still detect through, so it can
@@ -2140,6 +2441,9 @@ class TurretApp:
             range_m=0.0,
             face_count=0,
             link=self.link.status() if self.link is not None else LinkStatus(),
+            attitude=self._measured_pitch(
+                self.link.status().pitch_deg if self.link is not None else 0.0,
+                _now()),
             message="INTERLOCK FAILURE: %s" % why,
         )
         self.status_slot.put(status)
@@ -2171,6 +2475,21 @@ class TurretApp:
         if report is not None:
             infer_ms += report.infer_ms
 
+        # The pose overlay. The ghost is the DEAD-RECKONED pose, never
+        # `link_status.pitch_deg`: `command()` refuses to run while servoing,
+        # so that one is frozen for the whole of a track and the overlay would
+        # have drawn a stationary ghost against a moving solid -- which is the
+        # picture of a seized mechanism, invented out of a link that is working
+        # exactly as designed. See ReckonedPose.
+        _t = _now()
+        ghost = ReckonedPose(pitch_deg=self._pose[0], yaw_deg=self._pose[1],
+                             valid=self._pose_valid,
+                             age_s=max(0.0, _t - self._pose_t) if self._pose_t else 0.0)
+        # The solid model's sign comes from the ghost, so both must be the same
+        # pose -- pass the one the GUI will actually draw.
+        attitude = self._measured_pitch(ghost.pitch_deg if ghost.valid
+                                        else link_status.pitch_deg, _t)
+
         status = SystemStatus(
             track=self.tracker.state,
             laser=laser,
@@ -2183,6 +2502,8 @@ class TurretApp:
             range_m=item.estimate.range_m,
             face_count=len(report.faces) if report is not None else 0,
             link=link_status,
+            attitude=attitude,
+            pose=ghost,
             message=self._status_message,
         )
         self.status_slot.put(status)
@@ -2280,6 +2601,33 @@ class TurretApp:
                  "narrow camera for %.0f s. Configured rotation is %d deg."
                  % (seconds, self.face_detector.rotation_deg), "warn")
 
+        # SAVE WHAT IT SCORED, OR THE VERDICT CANNOT BE AUDITED.
+        #
+        # run_2026-09-20_183021 refused ARM at 0/38 and the frames were gone:
+        # the flight recorder runs from launch (imu.jsonl covers the whole
+        # session) but the control loop publishes nothing until START, so the
+        # 6 s before it leaves no images at all. "0/38" then cannot be told
+        # apart from "nobody stood in front of the camera", which is exactly
+        # the question that mattered -- and it is a SAFETY gate.
+        #
+        # Cheap on purpose: 38 JPEGs over 6 s, written on the thread that is
+        # already blocking for those 6 s. Nothing here may raise: this runs
+        # inside on_arm(), and a failed write must never be the reason the beam
+        # is refused or permitted.
+        # Imported here, not in the loop: `verdict` below needs it even when
+        # the loop never ran (frames = 0), which is precisely the case worth
+        # recording.
+        import json as _json
+        shot_dir = None
+        try:
+            base = (Path(self._run_dir) if self._run_dir is not None
+                    else Path("diag") / "face_checks")
+            shot_dir = base / ("face_check_%s" % time.strftime("%H%M%S"))
+            shot_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:                                  # noqa: BLE001
+            shot_dir = None
+        scored = []
+
         deadline = _now() + float(seconds)
         hits = wins = losses = frames = 0
         best_here = best_there = 0.0
@@ -2301,6 +2649,16 @@ class TurretApp:
                     wins += 1
                 elif there > here:
                     losses += 1
+            if shot_dir is not None:
+                try:
+                    import cv2
+                    name = "%03d_here%.3f_there%.3f.jpg" % (frames, here, there)
+                    cv2.imwrite(str(shot_dir / name), frame.image)
+                    scored.append({"n": frames, "frame_index": frame.index,
+                                   "here": float(here), "there": float(there),
+                                   "file": name})
+                except Exception:                          # noqa: BLE001
+                    shot_dir = None                        # stop trying, keep checking
 
         ok = hits >= int(need) and wins > losses
         self._face_orientation_detail = (
@@ -2309,6 +2667,23 @@ class TurretApp:
             % (hits, frames, self.face_detector.rotation_deg, best_here,
                best_there, losses, wins))
         self._face_orientation_ok = ok
+        if shot_dir is not None:
+            try:
+                with open(shot_dir / "verdict.json", "w", encoding="utf-8") as fh:
+                    _json.dump({"passed": bool(ok), "hits": hits, "frames": frames,
+                               "need": int(need), "seconds": float(seconds),
+                               "rotation_deg": self.face_detector.rotation_deg,
+                               "face_conf": config.FACE_CONF,
+                               "best_here": float(best_here),
+                               "best_there": float(best_there),
+                               "wins": wins, "losses": losses,
+                               "detail": self._face_orientation_detail,
+                               "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                    time.gmtime()),
+                               "scored": scored}, fh, indent=2)
+                self.log("face check frames saved -> %s" % shot_dir, "info")
+            except Exception:                              # noqa: BLE001
+                pass
         if ok:
             self.log("FACE INTERLOCK VERIFIED: %s" % self._face_orientation_detail,
                      "good")
@@ -2327,6 +2702,9 @@ class TurretApp:
         self._safe_state("operator STOP")
 
     def on_arm(self) -> None:
+        if getattr(self.args, "tracking_only", False):
+            self.log("ARM refused: --tracking-only comparison run", "warn")
+            return
         # The orientation self-check is the one thing that proves the face
         # interlock can SEE a face through this build's rotation constant. A
         # wrong NARROW_ROTATION_DEG sign makes YuNet return [] for every frame,
@@ -2475,7 +2853,10 @@ class TurretApp:
 
             # save=True (the default) writes turret_host/calibration/jacobian.json,
             # which is exactly where control.Jacobian.load() now looks.
-            calibrate.calibrate_jacobian(grab, move, progress=progress)
+            calibrate.calibrate_jacobian(
+                grab, move, progress=progress,
+                steps=int(calibrate.JACOBIAN_STEPS * config.MICROSTEP_DIVISOR / 16),
+                preload_steps=int(config.PRELOAD_STEPS))
 
             from turret_host import control
             self.controller.jacobian = control.Jacobian.load()
@@ -2511,6 +2892,66 @@ class TurretApp:
         self.link.set_laser(False)
         self.link.stop()
         self._status_message = "safe state: %s" % why
+
+    def _closing_home(self) -> None:
+        """Re-home pitch and yaw on the way out. Never raises.
+
+        THE CANCEL FLAG HAS TO BE CLEARED FIRST. shutdown() sets
+        _platform_cancel early, to stop a 40 s homing run that is holding the
+        link's io lock -- and homing._cmd() checks that predicate before every
+        single command, so leaving it set would make this abort on its first
+        line while looking like a board fault. Clearing it is safe here: the
+        task it was aimed at has already been joined above.
+
+        The cancel it installs instead is a DEADLINE plus a second close
+        request, so a window-close cannot be held hostage by a rig that is
+        not answering. A homing run is ~40 s; the budget is generous but
+        finite, and expiring it is reported rather than swallowed.
+        """
+        if self.sim or self.link is None:
+            return
+        if not getattr(self.args, "home_on_close", True):
+            self.log("closing home skipped (--no-home-on-close)", "warn")
+            return
+        # Nothing to return to if we never established a datum this session:
+        # a home on the way out would be the FIRST home, on an unattended rig,
+        # with the operator already walking away. Refuse rather than start
+        # 40 s of unwatched motion.
+        if not self._pose_valid:
+            self.log("closing home skipped: this session never homed, so "
+                     "there is no datum to return to.", "warn")
+            return
+
+        deadline = _now() + _CLOSING_HOME_BUDGET_S
+        self._platform_cancel.clear()
+
+        def _expired() -> bool:
+            return _now() > deadline
+
+        try:
+            from turret_host.homing import Homing
+
+            self.log("re-homing pitch and yaw before close (up to %.0f s)"
+                     % _CLOSING_HOME_BUDGET_S, "warn")
+            seq = Homing(self.link,
+                         lambda text, frac=None: self.log("  home: " + text),
+                         yaw_reference_lsb=self.args.yaw_reference,
+                         skip_level=getattr(self.args, "skip_level", False),
+                         cancel=_expired)
+            result = seq.run()
+            self.log("closed on a verified datum: pitch %+.3f yaw %+.3f (%s), "
+                     "%.2f deg from vertical"
+                     % (result.datum_pitch_deg, result.datum_yaw_deg,
+                        result.yaw_status, result.datum_residual_deg),
+                     "good" if result.datum_verified else "warn")
+        except BaseException as exc:                       # noqa: BLE001
+            # BaseException on purpose: a KeyboardInterrupt here must not skip
+            # the port close and camera release below.
+            self.log("closing home did not finish (%s). The turret is being "
+                     "left where it is -- check it is clear of its frame "
+                     "before the next run." % exc, "error")
+        finally:
+            self._platform_cancel.set()
 
     def shutdown(self) -> None:
         """Idempotent, and callable from any thread and any exception path."""
@@ -2612,6 +3053,24 @@ class TurretApp:
             self.log("step check failed (%s) -- continuing shutdown" % exc,
                      "warn")
 
+        # 2c. REHOME BEFORE CLOSING.
+        #
+        #     Placed after the step check (which is a diagnostic ABOUT the run
+        #     that just ended, and a rehome would destroy the datum it
+        #     compares against) and before the port closes.
+        #
+        #     Why home on the way out at all: the machine is left on a
+        #     repeatable pose rather than wherever tracking abandoned it, so
+        #     the next session starts from a known attitude instead of an
+        #     arbitrary one, and -- the part that matters for the payload --
+        #     it is left LEVEL and inside its measured soft limits rather than
+        #     parked against a stop with the coils released.
+        #
+        #     Wrapped completely, and it must stay that way. Shutdown is the
+        #     one path that cannot be allowed to raise: it still has to close
+        #     the port and release the cameras below.
+        self._closing_home()
+
         # 3. Release the cameras. A leaked handle costs the NEXT run:
         #    isOpened() returns True and every read() fails.
         for cam in (self.narrow_cam, self.wide_cam):
@@ -2663,14 +3122,28 @@ def build_parser() -> argparse.ArgumentParser:
                         "downscale: the horizontal field drops ~108 to ~85 deg")
     p.add_argument("--port", default=None,
                    help="force a serial port instead of resolving by VID/PID")
+    micro = p.add_mutually_exclusive_group()
+    micro.add_argument("--microstep", type=int, choices=(8, 16), default=16,
+                   help="fixed microstepping (default: 16); preserves angular rates and acceleration; requires microprofile firmware")
+    micro.add_argument("--dynamic-microstep", action="store_true",
+                   help="automatic 1/16 to 1/8, twice the narrow angular speed ceiling; unchanged angular acceleration; requires updated firmware")
+    p.add_argument("--tracking-only", action="store_true",
+                   help="disable ARM for this run (motor tracking remains available)")
     p.add_argument("--yaw-reference", type=float, default=None,
-                   help="the `my` LSB value that defines the yaw datum "
-                        "(see homing.py --save-ref). Without it, yaw comes up "
-                        "UNHOMED and homing only establishes a reference.")
+                   help="override the `my` LSB value that defines the yaw "
+                        "datum. Normally unnecessary: homing loads the stored "
+                        "reference from turret_host/calibration/ by itself, "
+                        "and saves one on the first run that establishes it.")
     p.add_argument("--fast-home", action="store_true",
-                   help="skip the 33-point magnetometer yaw sweep (~20 s of ~40 s). "
-                        "Pitch still comes from gravity; yaw becomes the current pose, "
-                        "which is what a run without a saved reference gets anyway.")
+                   help="DEPRECATED and ignored. It skipped the magnetometer "
+                        "yaw sweep, which is the only absolute yaw reference "
+                        "this machine has; the sweep now runs every time.")
+    p.add_argument("--no-home-on-close", dest="home_on_close",
+                   action="store_false", default=True,
+                   help="do not re-home pitch and yaw during shutdown. By "
+                        "default the turret is left on a verified level datum "
+                        "inside its soft limits rather than wherever tracking "
+                        "abandoned it.")
     p.add_argument("--lost-step-check", action="store_true",
                    help="run the ripple-phase lost-step check after homing")
     p.add_argument("--run-seconds", type=float, default=None,

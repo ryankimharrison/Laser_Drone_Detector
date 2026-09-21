@@ -149,13 +149,10 @@ class FlightRecorder:
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> "FlightRecorder":
-        # The IMU sampler is enabled separately by enable_imu(). Startup and
-        # homing own the same serial request/reply stream, and starting this
-        # thread before homing creates a race where `state` can receive the
-        # reply to `imu fast`. Files and frame writers may start immediately;
-        # board probing may not.
-        if self.link is not None:
-            self.enable_imu(self.link)
+        if self.link is not None and self.imu_period:
+            self._thread = threading.Thread(target=self._imu_loop,
+                                            name="telemetry-imu", daemon=True)
+            self._thread.start()
         if self.save_frames:
             self._writer = threading.Thread(target=self._frame_writer,
                                             name="telemetry-frames", daemon=True)
@@ -165,19 +162,6 @@ class FlightRecorder:
                 name="telemetry-wide", daemon=True)
             self._wide_writer.start()
         return self
-
-    def enable_imu(self, link) -> None:
-        """Start board sampling once setup/homing has released the serial link."""
-        if link is None or not self.imu_period or self._stop.is_set():
-            return
-        if self._thread is not None:
-            if self._thread.is_alive():
-                return
-            raise RuntimeError("IMU telemetry thread exited and cannot be restarted")
-        self.link = link
-        self._thread = threading.Thread(target=self._imu_loop,
-                                        name="telemetry-imu", daemon=True)
-        self._thread.start()
 
     # -- locked frames -----------------------------------------------------
     def offer_frame(self, image, box, label: str, aim=None) -> None:
@@ -488,9 +472,6 @@ class FlightRecorder:
                         tracker, "last_accel_clamp_px_s", 0.0)),
                 }
             # THE COMMAND. This is the half of the picture frames cannot show.
-            # This is the LAST ACK, not necessarily this control row's command.
-            # ack_t and the acknowledged request travel with it for alignment.
-            rec["gear_ack"] = getattr(self.link, "last_gear_report", None)
             if out is not None:
                 rec["cmd"] = {
                     "rate_a": _f(out.rate_a), "rate_b": _f(out.rate_b),

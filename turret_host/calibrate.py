@@ -158,7 +158,8 @@ def load_jacobian() -> Optional[np.ndarray]:
     data = load_calibration("jacobian")
     if data is None:
         return None
-    return np.asarray(data["J"], dtype=np.float64)
+    from turret_host.microstepping import scale_jacobian
+    return scale_jacobian(data["J"], data.get("microstep_divisor", 16))
 
 
 def load_goal_pixel() -> Optional[dict]:
@@ -546,6 +547,7 @@ def calibrate_jacobian(grab: Callable[[], np.ndarray],
         # this file can be handed straight to it. One measurement, two names --
         # never two matrices.
         "j_px_per_step": J.tolist(),
+        "microstep_divisor": config.MICROSTEP_DIVISOR,
         "J_inv": J_inv.tolist(),
         "units": "pixels per motor microstep; columns = (motor A/pan, motor B/tilt)",
         "steps": int(steps),

@@ -202,11 +202,10 @@ class Jacobian:
         # runaway later.
         for col in (0, 1):
             norm = float(np.linalg.norm(arr[:, col]))
-            expected = config.NARROW_F_PX * math.radians(config.AXIS_STEP_DEG)
-            if not (0.1 * expected <= norm <= 10.0 * expected):
+            if not (0.1 * EXPECTED_PX_PER_STEP <= norm <= 10.0 * EXPECTED_PX_PER_STEP):
                 raise ValueError(
                     f"J column {col} moves {norm:.4f} px/step; geometry predicts "
-                    f"~{expected:.3f} px/step. Refusing an implausible "
+                    f"~{EXPECTED_PX_PER_STEP:.3f} px/step. Refusing an implausible "
                     f"calibration -- re-run calibrate.py."
                 )
         return arr
@@ -227,8 +226,7 @@ class Jacobian:
         """config.J_PX_PER_STEP, or an uncalibrated instance if it is None."""
         if config.J_PX_PER_STEP is None:
             return cls()
-        from turret_host.microstepping import scale_jacobian
-        return cls(scale_jacobian(config.J_PX_PER_STEP), source="config.J_PX_PER_STEP")
+        return cls(config.J_PX_PER_STEP, source="config.J_PX_PER_STEP")
 
     @classmethod
     def load(cls, path: Path = JACOBIAN_PATH) -> "Jacobian":
@@ -246,10 +244,7 @@ class Jacobian:
         if "j_px_per_step" not in blob:
             raise ValueError(f"{path} has no 'j_px_per_step' key: {sorted(blob)}")
         meta = {k: v for k, v in blob.items() if k != "j_px_per_step"}
-        from turret_host.microstepping import scale_jacobian
-        matrix = scale_jacobian(blob["j_px_per_step"], blob.get("microstep_divisor", 16))
-        meta["microstep_divisor"] = config.MICROSTEP_DIVISOR
-        return cls(matrix, source=str(path), meta=meta)
+        return cls(blob["j_px_per_step"], source=str(path), meta=meta)
 
     @classmethod
     def auto(cls, path: Path = JACOBIAN_PATH) -> "Jacobian":
@@ -266,9 +261,8 @@ class Jacobian:
         blob = dict(self.meta)
         blob.update(extra)
         blob["j_px_per_step"] = self._j.tolist()
-        blob["microstep_divisor"] = config.MICROSTEP_DIVISOR
         blob["saved_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        blob["expected_px_per_step"] = config.NARROW_F_PX * math.radians(config.AXIS_STEP_DEG)
+        blob["expected_px_per_step"] = EXPECTED_PX_PER_STEP
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(blob, fh, indent=2, sort_keys=True)

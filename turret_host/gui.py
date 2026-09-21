@@ -70,6 +70,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 # this file: it has to run before `import threading`, not here.
 from turret_host import config
 from turret_host.types import (
+    AttitudeStatus,
     ControlOutput,
     Detection,
     DetectionResult,
@@ -81,6 +82,7 @@ from turret_host.types import (
     TrackEstimate,
     TrackState,
 )
+from turret_host.registration import WideNarrowRegistration, Warper
 
 # Optional: the 3D wrist view needs turret_host/assets/wrist_mesh.npz, which is
 # built from the CAD by tools/export_wrist_mesh.py. A checkout without it (or
@@ -121,6 +123,45 @@ FONT_MONO = "Consolas"
 FACE_COLOURS = ("#ff3b30", "#ff8f1f", "#ff1f8f", "#ffd21f")
 
 _UNSET = object()
+
+
+def _claim_dpi_awareness() -> float:
+    """Tell Windows this process scales itself. Returns the scaling in use.
+
+    MUST run before the Tk root exists -- Windows fixes a process's DPI mode
+    at the point the first window is created, and Tk asks for the desktop
+    metrics on the way up.
+
+    Without this the panel is handed a 1536x864 logical desktop on a
+    1920x1080 panel at 125%, lays itself out in those coordinates, and then
+    Windows bitmap-stretches the whole window back up. The camera panes come
+    out both smaller than the screen can show AND soft, which is half of why
+    they looked the way they did.
+
+    Returns the display scaling (1.25 for 125%) so the caller can set Tk's own
+    scaling and keep point-sized fonts at their intended PHYSICAL size --
+    claiming awareness without doing that just makes all the text small.
+
+    Everything here is best-effort: a machine that refuses, or is not Windows,
+    gets 1.0 and a panel that behaves exactly as it did before.
+    """
+    if not getattr(config, "DISPLAY_DPI_AWARE", True) or not sys.platform.startswith("win"):
+        return 1.0
+    try:
+        import ctypes
+        # -4 is PER_MONITOR_AWARE_V2. Preferred over SetProcessDpiAwareness
+        # because it also fixes non-client scaling and survives the window
+        # being dragged to a monitor with different scaling.
+        try:
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        except (AttributeError, OSError):
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)      # PER_MONITOR
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        return max(1.0, float(dpi) / 96.0)
+    except Exception:                                        # pragma: no cover
+        # Already set by the host, not Windows, or an old shcore. Harmless.
+        return 1.0
+
 
 # cv2 rotation codes, keyed by CLOCKWISE degrees. Display only -- nothing on
 # the processing path reads these.
@@ -292,32 +333,44 @@ class TurretGUI:
         # Registered-view calibration. Optional on purpose: a missing file
         # disables the fused pane and changes nothing else, so a machine that
         # has never run the Gray-code capture still brings the panel up.
-        self._fused = False
-        self._w2n_h: Optional[np.ndarray] = None
+        # The registered view is the DEFAULT pane now. It used to be opt-in
+        # because a plain homography visibly failed away from the centre of
+        # the overlap; registration.py models the wide lens's distortion and
+        # that is no longer true, so the registered view is simply the more
+        # truthful of the two. A machine that has never run the fit still
+        # brings the panel up -- `_reg` is None and the pane falls back to
+        # plain WIDE, which is exactly the old behaviour.
+        self._reg = WideNarrowRegistration.load()
+        self._warper = Warper(self._reg) if self._reg is not None else None
+        self._fused = bool(config.FUSED_VIEW_DEFAULT) and self._reg is not None
+        # Beam positions measured independently in each camera, from the
+        # Gray-code capture. Kept from the legacy file: they are measurements
+        # of the beam, not of the registration, so the new fit does not
+        # supersede them. Drawing BOTH is the point -- the gap between the two
+        # markers is the registration error made visible.
         self._laser_wide: Optional[Tuple[float, float]] = None
         self._laser_narrow: Optional[Tuple[float, float]] = None
-        self._w2n_rms = 0.0
-        self._w2n_range = 0.0
         try:
             _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "calibration", "wide_narrow_homography.json")
             with open(_p, "r", encoding="utf-8") as _fh:
                 _b = json.load(_fh)
-            self._w2n_h = np.array(_b["H_wide_to_narrow"], float)
-            self._w2n_rms = float(_b.get("rms_px", 0.0))
-            self._w2n_range = float(_b.get("range_m", 0.0))
             _lw, _ln = _b.get("laser_wide_px"), _b.get("laser_narrow_px")
             self._laser_wide = tuple(_lw) if _lw else None
             self._laser_narrow = tuple(_ln) if _ln else None
         except (OSError, ValueError, KeyError, TypeError):
-            self._w2n_h = None
+            pass
         self._closing = False
         self._after_id: Optional[str] = None
 
         self._tick_ms = max(1, int(round(1000.0 / config.DISPLAY_FPS)))
 
         # ---- display geometry -----------------------------------------
-        self._dw, self._dh = config.DISPLAY_SIZE
+        # Provisional. The real pane size is chosen in `_fit_panes_to_screen`
+        # once the chrome exists and can be MEASURED, because the old
+        # hard-coded guess at how tall the chrome is turned out to be the
+        # thing that made the panes tiny.
+        self._dw, self._dh = config.DISPLAY_MIN_SIZE
         # _rot is CLOCKWISE degrees. config resolved the direction on the live
         # preview (NARROW_ROTATE_CLOCKWISE), so honour the flag instead of
         # assuming: getting it backwards puts the pane upside down, which reads
@@ -329,11 +382,12 @@ class TurretGUI:
                 f"NARROW_ROTATION_DEG must be 0/90/180/270, got {config.NARROW_ROTATION_DEG}"
             )
         self._nw, self._nh = _rotated_size(self._dw, self._dh, self._rot)
-        self._fit = 1.0                  # set once the screen size is known
-
-        self._font_s = _overlay_font(12)
-        self._font_m = _overlay_font(14)
-        self._font_l = _overlay_font(18)
+        # `_fit` survives only as the blit-time scale, and it is 1.0 in normal
+        # operation now: panes are DRAWN at their own pixel size rather than
+        # drawn at 640x360 and resampled. It stays because the window can
+        # still be given a size the raster cap cannot match.
+        self._fit = 1.0
+        self._set_overlay_scale()
 
         self._photo_narrow: Optional[ImageTk.PhotoImage] = None
         self._photo_wide: Optional[ImageTk.PhotoImage] = None
@@ -341,25 +395,23 @@ class TurretGUI:
         self._item_wide: Optional[int] = None
 
         # ---- build ----------------------------------------------------
+        # Before tk.Tk(): Windows fixes a process's DPI mode when its first
+        # window appears, so this cannot be done after the root exists.
+        self._dpi_scale = _claim_dpi_awareness()
+
         self.root = tk.Tk()
         self.root.title(title)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.report_callback_exception = self._report_callback_exception
+        if self._dpi_scale > 1.0:
+            # Having claimed the real pixels, keep POINT-sized fonts at the
+            # physical size they were designed for. Tk's scaling is
+            # pixels-per-point; the stock Windows value is 96/72.
+            self.root.tk.call("tk", "scaling", self._dpi_scale * 96.0 / 72.0)
 
-        # DISPLAY_SIZE stays the drawing size: overlays, line widths and text
-        # are all laid out against it, and the frame copy is always exactly
-        # DISPLAY_SIZE. But the rotated narrow pane is 640 px tall on its own,
-        # so on a short screen the finished image is scaled once at blit time.
-        # Nothing upstream of the blit changes.
-        chrome_px = 540                  # banner + controls + progress + log + padding
-        available = self.root.winfo_screenheight() - 90 - chrome_px
-        if available < self._nh:
-            self._fit = max(0.5, available / float(self._nh))
-            self.log(f"panel scaled to {self._fit:.2f} to fit a "
-                     f"{self.root.winfo_screenheight()} px screen", "warn")
-        self._pane_n = (max(1, int(self._nw * self._fit)), max(1, int(self._nh * self._fit)))
-        self._pane_w = (max(1, int(self._dw * self._fit)), max(1, int(self._dh * self._fit)))
+        self._pane_n = (self._nh, self._nw)
+        self._pane_w = (self._dw, self._dh)
 
         self._build_style()
         self._build_banner()
@@ -367,15 +419,140 @@ class TurretGUI:
         self._build_controls()
         self._build_progress()
         self._build_log()
+        # Sized against a provisional raster so far. Now that every piece of
+        # chrome exists, measure it and give the panes everything that is
+        # left -- see the method for why this is not a hard-coded number.
+        self._fit_panes_to_screen()
         self._build_wrist_view()
 
-        self.root.minsize(self._pane_n[0] + self._pane_w[0] + 60,
-                          min(self._pane_n[1] + 400, self.root.winfo_screenheight() - 60))
+        self.root.minsize(min(self._pane_n[0] + self._pane_w[0] + 60,
+                              self.root.winfo_screenwidth() - 40),
+                          min(self._pane_n[1] + 400,
+                              self.root.winfo_screenheight() - 60))
         # Pin to the top of the screen: the panel is tall, and a window manager
         # that centres it pushes the log and the E-STOP off the bottom edge.
         self.root.geometry("+30+0")
         self._refresh_controls()
         self.log("GUI up. Laser DISARMED. Homing has not run.", "warn")
+
+    # ------------------------------------------------------------------
+    #   pane geometry
+    # ------------------------------------------------------------------
+    def _set_overlay_scale(self) -> None:
+        """Re-derive every overlay metric from the current pane width.
+
+        Fonts, line widths and marker sizes were all chosen against a 640 px
+        pane. If the pane grows and they do not, the boxes turn into hairlines
+        and the captions into specks -- which is the failure mode of every
+        naive "just make the window bigger" change. Everything drawn goes
+        through `_k`, `_lw` or these fonts so there is one place to get it
+        right.
+        """
+        self._k = max(1.0, self._dw / float(config.DISPLAY_SCALE_REF))
+        self._font_s = _overlay_font(self._sz(12))
+        self._font_m = _overlay_font(self._sz(14))
+        self._font_l = _overlay_font(self._sz(18))
+
+    def _sz(self, n: float) -> int:
+        """A reference-pane pixel size, scaled to this pane."""
+        return max(1, int(round(n * self._k)))
+
+    def _lw(self, n: float) -> int:
+        """A line width. Grows more slowly than the pane: a 4 px E-STOP border
+        scaled linearly to a 1400 px pane would be a 9 px slab."""
+        return max(1, int(round(n * (1.0 + (self._k - 1.0) * 0.6))))
+
+    def _fit_panes_to_screen(self) -> None:
+        """Choose the largest pane raster that actually fits, and apply it.
+
+        THE CHROME IS MEASURED, NOT GUESSED. The previous version subtracted a
+        hard-coded 540 px for "banner + controls + progress + log + padding"
+        and could only ever scale the panes DOWN from 640x360, with a floor of
+        0.5. On this rig that arithmetic gave 864 - 90 - 540 = 234 px of room
+        for a pane that wants 640, so it clamped to the floor and every camera
+        view rendered at 320x180 -- then Windows stretched it another 1.25x.
+        A guess that is wrong by 150 px is invisible in the code and very
+        visible on the screen, so now the widgets are asked how tall they are.
+
+        THE BINDING CONSTRAINT IS THE NARROW PANE BEING PORTRAIT. It is the
+        16:9 raster rotated 90 degrees for the mount, so it is as tall as the
+        raster is WIDE -- a 900 px raster needs 900 px of height where the
+        wide pane needs 506. That is why the telemetry, the Q bar and the log
+        moved into a column beside the video rather than under it: it buys
+        ~350 px of height, and height is the whole budget.
+        """
+        self.root.update_idletasks()
+        screen_h = self.root.winfo_screenheight()
+        screen_w = self.root.winfo_screenwidth()
+
+        # What everything that is NOT a camera pane currently demands.
+        chrome_h = max(0, self.root.winfo_reqheight() - self._body.winfo_reqheight())
+        chrome_w = max(0, self._body.winfo_reqwidth()
+                       - (self._pane_n[0] + self._pane_w[0]))
+        # Title bar, taskbar and a little slack. Generous on purpose: a panel
+        # whose E-STOP is one pixel off the bottom of the screen is worse than
+        # one whose panes are 40 px smaller than they could have been.
+        margin_h, margin_w = 96, 60
+
+        avail_h = screen_h - chrome_h - margin_h
+        avail_w = screen_w - chrome_w - margin_w
+
+        lo_w, lo_h = config.DISPLAY_MIN_SIZE
+        hi_w, hi_h = config.DISPLAY_MAX_SIZE
+        aspect = lo_h / float(lo_w)                 # 9:16, from the raster
+
+        # Height: the narrow pane is `raster_width` tall once rotated, and the
+        # wide column is the wide pane plus whatever sits under it.
+        by_height = float(avail_h)
+        # Width: narrow pane (raster HEIGHT wide) + wide pane (raster width).
+        by_width = avail_w / (1.0 + aspect)
+
+        want_w = int(max(lo_w, min(hi_w, min(by_height, by_width))))
+        # Keep it even so the 2x1 rotate and the centre pixel stay exact.
+        want_w -= want_w % 2
+        want_h = int(round(want_w * aspect))
+        want_h -= want_h % 2
+        self._apply_pane_size(want_w, want_h)
+
+        self.log("panes %dx%d (narrow %dx%d)  chrome measured at %d px%s"
+                 % (self._dw, self._dh, self._pane_n[0], self._pane_n[1],
+                    chrome_h,
+                    "  DPI %.2fx" % self._dpi_scale if self._dpi_scale > 1.0 else ""),
+                 "info")
+        if want_w <= lo_w:
+            self.log("panes are at the %dpx floor -- the screen cannot fit "
+                     "more. Raise config.DISPLAY_MAX_SIZE only if this is "
+                     "wrong." % lo_w, "warn")
+
+    def _apply_pane_size(self, width: int, height: int) -> None:
+        """Resize the drawing raster and the canvases together.
+
+        These two must never disagree: the raster IS the pane, which is what
+        removes the resample at blit time.
+        """
+        self._dw, self._dh = int(width), int(height)
+        self._nw, self._nh = _rotated_size(self._dw, self._dh, self._rot)
+        self._pane_n = (self._nw, self._nh)
+        self._pane_w = (self._dw, self._dh)
+        self._fit = 1.0
+        self._set_overlay_scale()
+        # A new raster means new warp tables.
+        if self._warper is not None:
+            self._warper.invalidate()
+        self._canvas_narrow.configure(width=self._pane_n[0], height=self._pane_n[1])
+        self._canvas_wide.configure(width=self._pane_w[0], height=self._pane_w[1])
+        self._qw = self._pane_w[0]
+        self._canvas_q.configure(width=self._qw)
+        self._canvas_q.coords(self._q_peak_line, 0, 0, 0, 26)
+        # PhotoImages are sized to the old raster; drop them so `_blit`
+        # rebuilds rather than silently pasting into a buffer of the wrong
+        # shape.
+        for canvas, item in ((self._canvas_narrow, self._item_narrow),
+                             (self._canvas_wide, self._item_wide)):
+            if item is not None:
+                canvas.delete(item)
+        self._photo_narrow = self._photo_wide = None
+        self._item_narrow = self._item_wide = None
 
     # ------------------------------------------------------------------
     #   construction
@@ -437,9 +614,20 @@ class TurretGUI:
         self._link_lamp.pack()
 
     def _build_body(self) -> None:
+        """Three columns: narrow pane, wide/fused pane, and everything else.
+
+        THE THIRD COLUMN IS WHY THE PANES CAN BE BIG. Telemetry, the Q bar and
+        the log used to sit UNDER the video, and the narrow pane is the 16:9
+        raster rotated 90 degrees for the mount -- so it is as tall as the
+        raster is wide. Stacking ~350 px of readouts below a pane that already
+        wants 900 px of height is what left 234 px for it on this screen.
+        Beside the video that height is free, and the window is nowhere near
+        the width of the screen.
+        """
         body = ttk.Frame(self.root)
         body.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
         self.root.rowconfigure(1, weight=1)
+        self._body = body
 
         # ---- narrow (rotated for display) -----------------------------
         left = ttk.Frame(body, style="Panel.TFrame")
@@ -453,15 +641,17 @@ class TurretGUI:
                                         highlightthickness=1, highlightbackground=EDGE)
         self._canvas_narrow.pack(padx=6, pady=(0, 6))
 
-        # ---- wide + Q bar + telemetry ---------------------------------
-        right = ttk.Frame(body)
-        right.grid(row=0, column=1, sticky="n")
+        # ---- wide / fused --------------------------------------------
+        mid = ttk.Frame(body)
+        mid.grid(row=0, column=1, sticky="n")
 
-        wide_box = ttk.Frame(right, style="Panel.TFrame")
+        wide_box = ttk.Frame(mid, style="Panel.TFrame")
         wide_box.grid(row=0, column=0, sticky="ew")
-        ttk.Label(wide_box,
-                  text=f"WIDE  {config.WIDE_SIZE[0]}x{config.WIDE_SIZE[1]}  (all detections + faces)",
-                  style="Head.TLabel", background=PANEL).pack(anchor="w", padx=6, pady=(4, 2))
+        self._wide_heading = ttk.Label(
+            wide_box,
+            text=f"WIDE  {config.WIDE_SIZE[0]}x{config.WIDE_SIZE[1]}  (all detections + faces)",
+            style="Head.TLabel", background=PANEL)
+        self._wide_heading.pack(anchor="w", padx=6, pady=(4, 2))
         self._canvas_wide = tk.Canvas(wide_box, width=self._pane_w[0], height=self._pane_w[1],
                                       bg="#05070a",
                                       highlightthickness=1, highlightbackground=EDGE)
@@ -469,8 +659,9 @@ class TurretGUI:
 
         # Adaptive-Q bar. A jink shows up as q slamming to the ceiling for a
         # few frames; the peak-hold marker keeps that visible long enough for
-        # a human to see it at 30 fps.
-        qbox = ttk.Frame(right, style="Panel.TFrame")
+        # a human to see it at 30 fps. Stays under the wide pane, matched to
+        # its width -- it is read against that picture.
+        qbox = ttk.Frame(mid, style="Panel.TFrame")
         qbox.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         head = tk.Frame(qbox, bg=PANEL)
         head.pack(fill="x", padx=6, pady=(4, 0))
@@ -488,11 +679,17 @@ class TurretGUI:
             x = frac * self._qw
             self._canvas_q.create_line(x, 0, x, 26, fill=EDGE, width=1)
 
-        self._build_telemetry(right)
+        # ---- side column: readouts, out of the video's height budget --
+        side = ttk.Frame(body)
+        side.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        side.rowconfigure(1, weight=1)
+        body.columnconfigure(2, weight=1)
+        self._side = side
+        self._build_telemetry(side)
 
     def _build_telemetry(self, parent) -> None:
         box = ttk.Frame(parent, style="Panel.TFrame")
-        box.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        box.grid(row=0, column=0, sticky="new")
         ttk.Label(box, text="TELEMETRY", style="Head.TLabel",
                   background=PANEL).grid(row=0, column=0, columnspan=4, sticky="w",
                                          padx=6, pady=(4, 2))
@@ -571,8 +768,24 @@ class TurretGUI:
         self._btn_wrist.pack(side="left")
         self._btn_fused = self._button(row, "FUSED", self._toggle_fused, width=10)
         self._btn_fused.pack(side="left", padx=(4, 0))
-        if self._w2n_h is None:
+        # PARALLAX cycles the range correction -1 / 0 / +1. It is a control
+        # rather than a setting because the sign is NOT KNOWN -- see
+        # config.FUSED_PARALLAX_SIGN. Both Gray-code captures are at the same
+        # range so the calibration cannot say which way it goes, and the one
+        # instrument that can is an operator looking at the double image close
+        # or open. Stand 4-5 m away when you use it: at the 2.08 m calibration
+        # plane the correction is zero by construction and all three settings
+        # look identical.
+        self._btn_parallax = self._button(row, "PARALLAX 0", self._cycle_parallax,
+                                          width=12)
+        self._btn_parallax.pack(side="left", padx=(4, 0))
+        if self._reg is None:
             self._btn_fused.configure(state="disabled")
+            self._btn_parallax.configure(state="disabled")
+        else:
+            self._btn_fused.configure(bg=CYAN if self._fused else PANEL_HI,
+                                      fg="#00222c" if self._fused else FG)
+            self._sync_parallax_button()
 
         stop = tk.Frame(bar, bg=PANEL)
         stop.pack(side="right", padx=8, pady=8)
@@ -603,10 +816,14 @@ class TurretGUI:
         self._progress_clock.pack(side="right", padx=10)
 
     def _build_log(self) -> None:
-        box = tk.Frame(self.root, bg=PANEL)
-        box.grid(row=4, column=0, sticky="nsew", padx=8, pady=(4, 8))
-        self.root.rowconfigure(4, weight=0)
-        self._log_text = tk.Text(box, height=7, bg="#0a0d12", fg=FG, font=(FONT_MONO, 9),
+        # In the side column, not across the bottom. Under the video it cost
+        # ~130 px of the height budget that the portrait narrow pane needs;
+        # beside it that height is free. It also gets TALLER this way, which
+        # is what you want from a log.
+        box = tk.Frame(self._side, bg=PANEL)
+        box.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        self._log_text = tk.Text(box, width=52, height=18, bg="#0a0d12", fg=FG,
+                                 font=(FONT_MONO, 9),
                                  relief="flat", bd=0, highlightthickness=1,
                                  highlightbackground=EDGE, wrap="none", state="disabled")
         self._log_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
@@ -635,6 +852,7 @@ class TurretGUI:
         """
         self._wrist_win = None
         self._wrist_view = None
+        self._build_pose_inset()
         # Track visibility ourselves. `winfo_viewable()` is false whenever an
         # ancestor is unmapped, so a minimised main window would silently stop
         # the feed and the view would come back showing a stale pose.
@@ -667,10 +885,67 @@ class TurretGUI:
             self.log(f"3D wrist view failed to start: {exc}", "warn")
             self._wrist_win = self._wrist_view = None
 
+    def _build_pose_inset(self) -> None:
+        """The pose overlay: the same CAD, small, in a corner of the wide pane.
+
+        An OVERLAY rather than another pane, and that is the whole reason it
+        can exist here at all. `_build_wrist_view` explains why the 3D view is
+        a separate window: the main panel is already sized to the screen and
+        another 280 px of content pushes the E-STOP off the bottom of the
+        laptop this runs on. Compositing into the video costs zero layout
+        height, so the constraint does not apply.
+
+        It runs whether or not the operator has the big 3D window open -- the
+        question it answers ("is the head where the controller thinks it is?")
+        is one you want answered while you are watching the drone, not one you
+        go and open a window to ask.
+        """
+        self._pose_inset = None
+        if not getattr(config, "POSE_OVERLAY", False):
+            return
+        if _wristview is None or not _wristview.MESH_PATH.exists():
+            return                       # same diagnostic-not-flight-equipment rule
+        try:
+            self._pose_inset = _wristview.PoseInset(
+                size=tuple(config.POSE_OVERLAY_SIZE),
+                fps=float(config.POSE_OVERLAY_FPS))
+        except Exception as exc:                             # pragma: no cover
+            self.log(f"pose overlay failed to start: {exc}", "warn")
+            self._pose_inset = None
+
+    def _paste_pose_inset(self, pane: Image.Image) -> None:
+        """Composite the newest finished inset into `pane`, in place.
+
+        Takes whatever the worker has ready and never waits for it: a slow
+        render shows a slightly old pose, it does not drop a video frame.
+        """
+        if self._pose_inset is None:
+            return
+        img = self._pose_inset.latest()
+        if img is None:
+            return
+        m = int(config.POSE_OVERLAY_MARGIN)
+        # Never let the inset exceed a third of the pane's area budget. It is
+        # rendered at a fixed pixel size, but the pane's size is not fixed --
+        # `_fit` shrinks it on a short screen and may grow it on a tall one --
+        # so a fixed inset can end up covering the view it is annotating.
+        # Positioned from the pane's own dimensions, so the corner is right at
+        # any size.
+        cap = min(pane.width * 0.45, pane.height * 0.62)
+        if img.width > cap:
+            s = cap / img.width
+            img = img.resize((max(1, int(img.width * s)),
+                              max(1, int(img.height * s))), Image.LANCZOS)
+        corner = str(config.POSE_OVERLAY_CORNER).lower()
+        x = m if corner in ("tl", "bl") else pane.width - img.width - m
+        y = m if corner in ("tl", "tr") else pane.height - img.height - m
+        pane.paste(img, (max(0, x), max(0, y)))
+
     def _toggle_fused(self) -> None:
-        if self._w2n_h is None:
-            self.log("FUSED unavailable: calibration/wide_narrow_homography.json "
-                     "is missing. Run tools/structured_light_map.py.", "warn")
+        if self._reg is None:
+            self.log("FUSED unavailable: calibration/wide_narrow_registration.json "
+                     "is missing. Run tools/fit_wide_narrow_registration.py "
+                     "--write (offline, no hardware).", "warn")
             return
         self._fused = not self._fused
         self._btn_fused.configure(bg=CYAN if self._fused else PANEL_HI,
@@ -679,9 +954,40 @@ class TurretGUI:
         # advanced, so without this the pane keeps the old rendering until the
         # next frame arrives -- which looks like the button did nothing.
         self._frame_seq_drawn = -1
-        self.log("fused view %s (registered at %.2f m, RMS %.2f px)"
+        self.log("fused view %s (registered at %.2f m, RMS %.2f narrow px)"
                  % ("ON" if self._fused else "OFF",
-                    self._w2n_range, self._w2n_rms), "info")
+                    self._reg.range_m, self._reg.rms_px), "info")
+
+    def _sync_parallax_button(self) -> None:
+        sign = self._reg.parallax_sign if self._reg else 0
+        self._btn_parallax.configure(
+            text="PARALLAX %+d" % sign if sign else "PARALLAX 0",
+            bg=AMBER if sign else PANEL_HI,
+            fg="#2a1a00" if sign else FG)
+
+    def _cycle_parallax(self) -> None:
+        """Step the range-correction sign -1 -> 0 -> +1 -> -1, live.
+
+        The whole point is that this is reversible in one click while
+        somebody watches the overlay. Nothing is written to disk: when a sign
+        is found to be the right one it goes in config.FUSED_PARALLAX_SIGN by
+        hand, so a value that survives is a value a person chose.
+        """
+        if self._reg is None:
+            return
+        nxt = {-1: 0, 0: 1, 1: -1}[self._reg.parallax_sign]
+        self._reg = self._reg.with_sign(nxt)
+        self._warper = Warper(self._reg)
+        self._sync_parallax_button()
+        self._frame_seq_drawn = -1
+        r = self._status.range_m if self._status else None
+        near = (r is not None and abs(r - self._reg.range_m) < 0.4)
+        self.log("parallax sign %+d (%.1f narrow px at 5 m)%s"
+                 % (nxt, self._reg.with_sign(nxt or 1).parallax_shift_px(5.0),
+                    "  -- but the target is at the calibration plane, where "
+                    "the correction is ZERO for every sign. Move to 4-5 m."
+                    if near else ""),
+                 "warn" if near else "info")
 
     def _toggle_wrist_view(self) -> None:
         if self._wrist_win is None:
@@ -698,15 +1004,65 @@ class TurretGUI:
             self._wrist_win.withdraw()
             self._wrist_shown = False
 
-    def _feed_wrist_view(self) -> None:
-        """Hand the view the pose the link last reported. Called every tick."""
-        if self._wrist_view is None or not self._wrist_shown:
-            return
-        link = self._status.link
+    def _pose_args(self) -> dict:
+        """The two poses and the caption that explains them.
+
+        Returns kwargs for `wristview.set_pose`. The solid model is where the
+        payload measurably IS; the ghost is where the controller believes it
+        is. The gap between them is backlash, lost steps, compliance or slip --
+        the mechanical error the control loop is blind to, because it counts
+        steps and trusts them.
+        """
+        att = self._status.attitude
+        # The ghost is the DEAD-RECKONED pose. `link.pitch_deg` only updates
+        # inside a blocking command, and those are refused while servoing, so
+        # it is frozen for the whole of a track -- drawing it would show a
+        # stationary ghost against a moving solid, which is this display's
+        # signature for a seized mechanism. Fall back to it only when dead
+        # reckoning has no datum yet (before homing), where nothing is moving.
+        dr = self._status.pose
+        link = dr if dr.valid else self._status.link
         # A dim beam always shows where the boresight points; a bright one
         # means the interlock actually let it fire.
         beam = 1.0 if self._status.laser is LaserState.FIRING else 0.22
-        self._wrist_view.set_pose(link.pitch_deg, link.yaw_deg, beam)
+
+        if not att.ok:
+            # NO GHOST, and the dead-reckoned pose becomes the solid one. The
+            # alternative -- holding the last measured pose while the ghost
+            # moves on -- draws a stationary payload against a moving command,
+            # which is the picture of a seized mechanism. Inventing that out of
+            # a dropped serial reply would be the worst failure this display
+            # could have.
+            return dict(pitch_deg=link.pitch_deg, yaw_deg=link.yaw_deg, beam=beam,
+                        ghost=None, state="NO IMU", level="bad",
+                        note=att.note or "dead-reckoned only")
+
+        if att.moving:
+            # The accelerometer measures gravity PLUS whatever the payload is
+            # doing, and the IMU sits 42.5 mm off the pitch axis, so under
+            # angular acceleration it reads tangential acceleration as tilt.
+            state, level = "MOVING", "warn"
+            note = "moving: accel invalid"
+        else:
+            state, level = "HOLDING", "ok"
+            # Short on purpose: the caption box widens to fit its text, and at
+            # 260 px a full sentence grows it across the model it is
+            # annotating. The row labels carry the rest of the meaning.
+            note = "yaw: dead-reckoned"
+
+        return dict(pitch_deg=att.pitch_deg, yaw_deg=link.yaw_deg, beam=beam,
+                    ghost=(link.pitch_deg, link.yaw_deg),
+                    state=state, level=level, note=note, scale=att.scale)
+
+    def _feed_wrist_view(self) -> None:
+        """Hand both views the newest pair of poses. Called every tick."""
+        if (self._wrist_view is None or not self._wrist_shown) and self._pose_inset is None:
+            return
+        args = self._pose_args()
+        if self._wrist_view is not None and self._wrist_shown:
+            self._wrist_view.set_pose(**args)
+        if self._pose_inset is not None:
+            self._pose_inset.set_pose(**args)
 
     # ------------------------------------------------------------------
     #   public API -- safe from any thread
@@ -1007,6 +1363,10 @@ class TurretGUI:
             pil_w = self._render_fused(narrow, wide, state)
         else:
             pil_w = self._render_wide(wide, state)
+        # After the overlays, so the inset sits on top of boxes and captions
+        # rather than under them; and on whichever view is in the pane, because
+        # FUSED replaces WIDE rather than sitting beside it.
+        self._paste_pose_inset(pil_w)
 
         self._photo_narrow, self._item_narrow = self._blit(
             self._canvas_narrow, self._item_narrow, self._photo_narrow, pil_n)
@@ -1177,55 +1537,79 @@ class TurretGUI:
 
     # -- fused / registered ---------------------------------------------
     def _render_fused(self, narrow: Optional[np.ndarray],
-                      wide: Optional[np.ndarray], state: dict) -> Image.Image:
+                      wide: Optional[np.ndarray], state: dict,
+                      skew_ms: Optional[float] = None) -> Image.Image:
         """Both cameras in ONE frame, registered, so a physical point lands in
         one place.
 
         Composited in WIDE pixel coordinates, not narrow, because the wide
-        camera's field strictly contains the narrow one: the narrow view maps
-        to a 540x951 box inside 1920x1080, so this direction crops nothing.
-        Rendering in narrow coordinates would throw away most of the wide frame.
+        camera's field strictly contains the narrow one -- so this direction
+        crops nothing, where rendering in narrow coordinates would throw away
+        most of the wide frame.
 
-        The registration is the measured homography (wide -> narrow) from the
-        projected Gray-code correspondence, inverted. A homography is the exact
-        model for two views of ONE PLANE, which is what it was measured on --
-        so this is exact on the calibration plane at 2.083 m, and degrades off
-        it by the disparity, ~38 narrow px at that range falling as 1/R. The
-        laser dots coincide here because the IMAGES are registered, not because
-        anything is drawn on top of them.
+        THE GEOMETRY LIVES IN registration.py, NOT HERE. That module holds the
+        distortion model, the range term and -- the part this function used to
+        get wrong -- the rule for converting a delivered wide frame into the
+        coordinates the calibration was measured in. Read its docstring before
+        changing anything below.
+
+        WHAT THIS PANE IS HONEST ABOUT
+        ------------------------------
+        Three different things push the two layers apart and they look
+        different, so the pane names all three rather than presenting one
+        number:
+
+          * LENS. Removed by the fitted model; what is left is 0.5 narrow px
+            rms on the calibration plane, and the caption says when the
+            overlay reaches past the radius the fit was verified to.
+          * RANGE. Zero on the calibration plane, growing as 1/R away from it.
+            The caption shows the correction being applied, or OFF.
+          * TIME. The two frames are not simultaneous and no calibration can
+            fix that. `skew_ms` is shown, in amber past
+            config.FUSED_MAX_FRAME_SKEW_MS, because while the turret slews it
+            is the largest term of the three and it looks exactly like a
+            registration error.
         """
         if wide is None:
             return self._blank(self._dw, self._dh, "FUSED: no wide frame")
-        if self._w2n_h is None:
+        if self._reg is None or self._warper is None:
             return self._blank(self._dw, self._dh,
-                               "FUSED: no wide_narrow_homography.json")
+                               "FUSED: no wide_narrow_registration.json")
+
+        src_h, src_w = wide.shape[:2]
+        frame_size = (src_w, src_h)
+        # THE FRAME SIZE TRAP. The scale below comes from the frame in hand,
+        # never from config.WIDE_SIZE: --wide-fast delivers a 1280x720 CENTRE
+        # CROP and reading the constant instead would put every mapped point
+        # 320x180 wide px out -- about 520 narrow px, a different part of the
+        # room. registration.frame_offset() is the one place that decides what
+        # a given frame size means, and it refuses sizes it cannot account
+        # for rather than guessing.
+        fm = self._reg.frame_offset(frame_size)
+        if fm is None:
+            return self._blank(
+                self._dw, self._dh,
+                "FUSED: wide frame is %dx%d, registration was measured at "
+                "%dx%d" % (src_w, src_h, *self._reg.wide_capture_size))
 
         base = self._prepare(wide, 0)
-        out = np.array(base)                       # RGB, DISPLAY_SIZE
+        out = np.array(base)                       # RGB, pane-sized
 
-        # display <- wide is a pure scale, so the display-to-narrow map is
-        # H * S^-1. Folding the scale in here means warpPerspective samples the
-        # FULL-RESOLUTION narrow frame straight onto the display raster, with
-        # one interpolation instead of two.
-        sx = self._dw / float(config.WIDE_SIZE[0])
-        sy = self._dh / float(config.WIDE_SIZE[1])
-        s_inv = np.array([[1.0 / sx, 0, 0], [0, 1.0 / sy, 0], [0, 0, 1.0]])
-        m = self._w2n_h @ s_inv
+        est: Optional[TrackEstimate] = state["estimate"]
+        range_m = est.range_m if est is not None else None
 
-        if narrow is not None:
+        maps = self._warper.maps((self._dw, self._dh), frame_size, range_m)
+        if narrow is not None and maps is not None:
+            mx, my, inside = maps
             nrgb = cv2.cvtColor(narrow, cv2.COLOR_BGR2RGB)
-            # WARP_INVERSE_MAP: dst(u,v) = src(m*(u,v)). m already goes
-            # display -> narrow, so no inverse is computed here at all.
-            warped = cv2.warpPerspective(
-                nrgb, m, (self._dw, self._dh),
-                flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-                borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-            cover = cv2.warpPerspective(
-                np.full(narrow.shape[:2], 255, np.uint8), m,
-                (self._dw, self._dh),
-                flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
-                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            a = (cover > 0)[:, :, None]
+            # remap, not warpPerspective: the undistortion is not projective,
+            # so no 3x3 can express display -> wide -> undistort -> narrow.
+            # The tables are cached by `Warper` and only rebuilt when the pane
+            # size, the frame size or the range actually changes.
+            warped = cv2.remap(nrgb, mx, my, cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_CONSTANT,
+                               borderValue=(0, 0, 0))
+            a = inside[:, :, None]
             # 50/50 inside the overlap. A blend rather than narrow-on-top on
             # purpose: misregistration shows up as a visible double image, so
             # the operator can SEE the calibration rather than trust it.
@@ -1233,19 +1617,21 @@ class TurretGUI:
 
         img = Image.fromarray(out)
         d = ImageDraw.Draw(img)
+        sx, sy = self._dw / float(src_w), self._dh / float(src_h)
 
         def to_disp(x: float, y: float) -> Tuple[float, float]:
             return x * sx, y * sy
 
-        # Outline of the narrow field, mapped through the same transform.
-        h_inv = np.linalg.inv(self._w2n_h)
-        corners = np.array([[0, 0, 1], [config.NARROW_SIZE[0] - 1, 0, 1],
-                            [config.NARROW_SIZE[0] - 1, config.NARROW_SIZE[1] - 1, 1],
-                            [0, config.NARROW_SIZE[1] - 1, 1]], float)
-        q = corners @ h_inv.T
-        poly = [to_disp(p[0] / p[2], p[1] / p[2]) for p in q]
-        d.line(poly + [poly[0]], fill=CYAN, width=2)
-        self._label(d, poly[0][0] + 4, poly[0][1] + 14, "NARROW FIELD", CYAN)
+        # Outline of the narrow field. A CURVE, sampled along the border,
+        # not four corners joined by straight lines: once the lens is in the
+        # model this boundary genuinely bows, and drawing it straight would
+        # hide the very thing the model exists to correct.
+        poly = self._reg.narrow_outline(frame_size, range_m)
+        if poly is not None:
+            pts = [to_disp(px, py) for px, py in poly]
+            d.line(pts + [pts[0]], fill=CYAN, width=self._lw(2))
+            self._label(d, pts[0][0] + self._sz(4), pts[0][1] + self._sz(14),
+                        "NARROW FIELD", CYAN)
 
         # The beam, as MEASURED in each camera independently. Two markers, not
         # one: if the calibration is right they sit on top of each other, and
@@ -1253,13 +1639,17 @@ class TurretGUI:
         # a single marker would hide exactly the thing worth watching.
         if self._laser_wide is not None:
             lx, ly = to_disp(*self._laser_wide)
-            self._cross(d, lx, ly, GREEN, size=11, width=2)
-            self._label(d, lx + 13, ly - 6, "BEAM wide", GREEN)
+            self._cross(d, lx, ly, GREEN, size=self._sz(11), width=self._lw(2))
+            self._label(d, lx + self._sz(13), ly - self._sz(6), "BEAM wide", GREEN)
         if self._laser_narrow is not None:
-            p = np.array([self._laser_narrow[0], self._laser_narrow[1], 1.0]) @ h_inv.T
-            lx, ly = to_disp(p[0] / p[2], p[1] / p[2])
-            d.ellipse((lx - 7, ly - 7, lx + 7, ly + 7), outline=YELLOW, width=2)
-            self._label(d, lx + 13, ly + 12, "BEAM narrow", YELLOW)
+            q = self._reg.narrow_to_wide([self._laser_narrow], frame_size, range_m)
+            if q is not None:
+                lx, ly = to_disp(q[0][0], q[0][1])
+                r = self._sz(7)
+                d.ellipse((lx - r, ly - r, lx + r, ly + r), outline=YELLOW,
+                          width=self._lw(2))
+                self._label(d, lx + self._sz(13), ly + self._sz(12),
+                            "BEAM narrow", YELLOW)
 
         det: Optional[DetectionResult] = state["wide_det"]
         if det is not None:
@@ -1267,11 +1657,41 @@ class TurretGUI:
                 x1, y1 = to_disp(t.x1, t.y1)
                 x2, y2 = to_disp(t.x2, t.y2)
                 d.rectangle((min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)),
-                            outline=CYAN, width=2)
+                            outline=CYAN, width=self._lw(2))
 
-        self._label(d, 6, img.height - 6,
-                    "FUSED  registered at %.2f m  RMS %.2f px"
-                    % (self._w2n_range, self._w2n_rms), FG, "#000000")
+        # ---- the caption: what this registration is and is not ---------
+        sign = self._reg.parallax_sign
+        shift = self._reg.parallax_shift_px(range_m)
+        if sign:
+            par = "parallax %+d  %+.0f px @ %s" % (
+                sign, shift,
+                "%.1f m" % range_m if range_m else "no range")
+        else:
+            par = "parallax OFF"
+        self._label(d, self._sz(6), img.height - self._sz(6),
+                    "FUSED  %.2f px rms on the plane at %.2f m   %s"
+                    % (self._reg.rms_px, self._reg.range_m, par),
+                    FG, "#000000", font=self._font_s)
+
+        y = self._sz(16)
+        if skew_ms is not None:
+            late = abs(skew_ms) > config.FUSED_MAX_FRAME_SKEW_MS
+            self._label(d, self._sz(6), y,
+                        "frame skew %+.0f ms%s" % (
+                            skew_ms,
+                            "  -- LAYERS ARE FROM DIFFERENT MOMENTS" if late else ""),
+                        AMBER if late else MUTED, "#000000", font=self._font_s)
+            y += self._sz(15)
+        if fm.assumed:
+            self._label(d, self._sz(6), y, fm.note.upper(), AMBER, "#000000",
+                        font=self._font_s)
+            y += self._sz(15)
+        if self._reg.extrapolating():
+            self._label(d, self._sz(6), y,
+                        "outer band extrapolates past r=%.0f (verified) "
+                        "to r=%.0f" % (self._reg.verified_radius_px,
+                                       self._reg.narrow_footprint_radius_px),
+                        MUTED, "#000000", font=self._font_s)
         return img
 
     # -- wide -----------------------------------------------------------
@@ -1501,6 +1921,11 @@ class TurretGUI:
         finally:
             # Stop the view's render thread before the interpreter tears Tk
             # down, or it wakes up against a destroyed widget.
+            if getattr(self, "_pose_inset", None) is not None:
+                try:
+                    self._pose_inset.stop()
+                except Exception:
+                    pass
             if getattr(self, "_wrist_view", None) is not None:
                 try:
                     self._wrist_view._stop()
@@ -1562,6 +1987,8 @@ def _demo() -> None:
         t0 = time.perf_counter()
         i = 0
         q = 0.0
+        true_pitch = [12.4]        # the synthetic payload, behind the dead band
+        last_cmd = [12.4]
         while not stop.wait(1.0 / 30.0):
             t = time.perf_counter() - t0
             i += 1
@@ -1654,12 +2081,31 @@ def _demo() -> None:
                                       goal_u, goal_v, False, dot is not None),
                 dot_px=dot,
             )
+            # SYNTHETIC MECHANISM for the pose overlay. The commanded pitch
+            # is what the step counter believes; the payload follows it
+            # through a dead band, so it sticks on every reversal and then
+            # catches up -- which is backlash, and is what the overlay exists
+            # to show. Measured on this rig at 0.65 deg near level rising to
+            # 2.3 deg at 20-40 deg of pitch (bench, 2026-09-20).
+            cmd_pitch = 12.4 + 9.0 * np.sin(t)
+            lash = 0.5 * 2.0
+            if cmd_pitch > true_pitch[0] + lash:
+                true_pitch[0] = cmd_pitch - lash
+            elif cmd_pitch < true_pitch[0] - lash:
+                true_pitch[0] = cmd_pitch + lash
+            rate = abs(cmd_pitch - last_cmd[0]) * 30.0
+            last_cmd[0] = cmd_pitch
+
             gui.set_status(SystemStatus(
                 track=track, laser=laser,
                 narrow_fps=30.1, wide_fps=30.3, loop_hz=29.4, infer_ms=8.4,
                 q_level=q, error_px=err, range_m=config.ASSUMED_RANGE_M,
                 face_count=len(faces),
-                link=LinkStatus(True, "COM7", 3.2, i, 0, "", 12.4 + np.sin(t), -35.0 + 4 * np.sin(t * 0.6)),
+                link=LinkStatus(True, "COM7", 3.2, i, 0, "", cmd_pitch, -35.0 + 4 * np.sin(t * 0.6)),
+                attitude=AttitudeStatus(
+                    ok=True, pitch_deg=true_pitch[0], roll_deg=-4.4, age_s=0.05,
+                    moving=rate > config.POSE_STILL_RATE_DPS, rate_dps=rate,
+                    scale=0.983),
                 message="SYNTHETIC DATA -- no camera, no board attached",
             ))
 

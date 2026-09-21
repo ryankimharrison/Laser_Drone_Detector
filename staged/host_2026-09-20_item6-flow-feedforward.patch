@@ -1,0 +1,226 @@
+--- turret_host/config.py
++++ turret_host/config.py
+@@ -933,6 +933,49 @@
+ #: above. GATE_MAX_PX (300) still caps everything.
+ ASSOC_LONE_PX = 250.0
+ ASSOC_LONE_CONF = 0.5
++
++# --------------------------------------------------------------------------
++#   OPTICAL-FLOW VELOCITY FOR THE FEEDFORWARD  (item 6)
++# --------------------------------------------------------------------------
++# See turret_host/flowvel.py for the measurements behind these. In short:
++# differencing box centres is beaten by NAIVE at the 100-200 ms horizons, and
++# its frame-to-frame jump of 130-190 px/s is what flipped the feedforward's
++# sign. Flow on the box patch cuts that to 26-51 px/s and halves the prediction
++# error at the 66 ms loop latency.
++#
++# FEEDFORWARD_GAIN IS STILL 0.0. This ships the SOURCE and the logging only.
++# Raising the gain is a hardware exercise -- a wrong feedforward cannot be
++# scored by replay, because the turret would have moved differently -- so the
++# 0 -> 0.5 -> 1.0 ramp waits for a run on the rig.
++
++#: Search margin around the box, as a fraction of its size. The features come
++#: from inside the box; this is only room for them to move into.
++FLOW_ROI_PAD = 0.35
++#: Corners to ask for. 120 gives a MEASURED median of 118 survivors.
++FLOW_MAX_CORNERS = 120
++#: Fewer survivors than this is not a measurement.
++FLOW_MIN_POINTS = 6
++#: Forward-backward reprojection limit, px. A point that does not track home
++#: again did not track.
++FLOW_FB_MAX_PX = 1.0
++#: Median absolute deviation of the surviving vectors, px. Above this they
++#: disagree with each other and their median means nothing.
++FLOW_COHERENCE_PX = 3.0
++#: A larger gap than this between frames is not a frame interval.
++FLOW_MAX_DT_S = 0.25
++#: How long the last flow velocity may be used after flow goes silent, ramped
++#: LINEARLY to zero across the window. TWO frames at 30 fps, and 0.070 rather
++#: than 0.0667 on purpose: at exactly two frame periods the second frame lands
++#: on the boundary and is rejected by the `age <= FLOW_HOLD_S` test, so the
++#: hold is one frame, not two. Caught by the behavioural test. The margin is
++#: small enough that a third frame (100 ms) is still firmly outside.
++#:
++#: The fallback after that is ZERO feedforward -- pure P -- and deliberately
++#: NOT the Kalman velocity: its own frame-to-frame jump is still 85/250 px/s
++#: median/p90 on the fast run, and the blurred frames where flow goes silent
++#: are exactly where that would flip sign. Pure P costs bounded lag; a
++#: wrong-signed feedforward does not.
++FLOW_HOLD_S = 0.070
+ # Shrink the box per side before testing containment, as a fraction of its own
+ # width/height so it scales with range. The 283 mm airframe is ~132 px at 3 m,
+ # so 0.15 leaves ~92 px of permitted region there -- the body, not the rim,
+--- turret_host/control.py
++++ turret_host/control.py
+@@ -1146,7 +1146,10 @@
+     def compute(self, est: TrackEstimate, t_now: float, *,
+                 range_m: Optional[float] = None,
+                 dot_pixel: Optional[Sequence[float]] = None,
+-                pose: Optional[Sequence[float]] = None) -> ControlOutput:
++                pose: Optional[Sequence[float]] = None,
++                ff_velocity: Optional[Sequence[float]] = None,
++                ff_source: str = "est",
++                ff_points: int = 0) -> ControlOutput:
+         """Filtered estimate -> signed motor rates for `vel <A> <B>`.
+ 
+         Raises NotCalibratedError when J is uncalibrated.  It does not return
+@@ -1301,8 +1304,25 @@
+         # omega_at_box is the rate that was in effect when the box was
+         # measured, NOT the rate now: est.du describes motion that happened
+         # then. It is already maintained for the position-compensation path.
+-        ff_u, ff_v = est.du, est.dv
+-        self._v_target_hat = (float(est.du), float(est.dv))
++        # WHERE THE FEEDFORWARD'S VELOCITY COMES FROM.
++        #
++        # `ff_velocity`, when supplied, is optical flow on the box patch --
++        # see flowvel.py. It replaces est.du/dv HERE and nowhere else: the
++        # filter stays the estimator for the aim point, the association gate
++        # and everything downstream, and this is the feedforward term alone.
++        #
++        # None means the caller has no flow source wired up, and the old
++        # behaviour stands. (0.0, 0.0) is NOT the same thing -- that is the
++        # fallback tier saying "no trustworthy velocity, use pure P", and it
++        # must be honoured rather than quietly replaced with est.du/dv, which
++        # is the noisy source the whole change exists to stop using.
++        if ff_velocity is None:
++            ff_u, ff_v = est.du, est.dv
++            self._ff_source = "est"
++        else:
++            ff_u, ff_v = float(ff_velocity[0]), float(ff_velocity[1])
++            self._ff_source = ff_source
++        self._v_target_hat = (float(ff_u), float(ff_v))
+         self._ff_platform_px_s = 0.0
+         if config.FEEDFORWARD_SUBTRACT_PLATFORM                 and self._omega_at_box is not None                 and self.jacobian.is_calibrated:
+             try:
+@@ -1424,6 +1444,8 @@
+                             v_target_u=self._v_target_hat[0],
+                             v_target_v=self._v_target_hat[1],
+                             ff_platform_px_s=self._ff_platform_px_s,
++                            ff_source=getattr(self, "_ff_source", "est"),
++                            ff_points=int(ff_points or 0),
+                             omega_at_box_a=(None if ob is None else float(ob[0])),
+                             omega_at_box_b=(None if ob is None else float(ob[1])),
+                             p_scale=self._p_scale, authority=self._authority)
+--- turret_host/types.py
++++ turret_host/types.py
+@@ -134,6 +134,16 @@
+     #: Magnitude of the platform term removed from the feedforward, px/s.
+     #: Zero when the flag is off.
+     ff_platform_px_s: float = 0.0
++    #: Which tier supplied the feedforward velocity this frame:
++    #: "flow"  optical flow answered, all three guards passed
++    #: "held"  flow was silent; the last value, ramped linearly toward zero
++    #: "none"  no trustworthy velocity -- pure P this frame
++    #: "est"   no flow source wired up; the old est.du/dv path
++    #: Logged so an AAR can tell a lag caused by pure-P frames from one caused
++    #: by the control law. See flowvel.py.
++    ff_source: str = "est"
++    #: Surviving LK points behind a "flow" row; 0 on every other tier.
++    ff_points: int = 0
+     #: The commanded rate in effect when the box was measured, steps/s.
+     #: NOT the achieved rate -- VEL_ACCEL ramps at 40000 steps/s^2, so a
+     #: command needs 100 ms to be realised. Logged so that gap is measurable.
+--- turret_host/telemetry.py
++++ turret_host/telemetry.py
+@@ -477,6 +477,11 @@
+                     "v_target_u": _f(getattr(out, "v_target_u", None)),
+                     "v_target_v": _f(getattr(out, "v_target_v", None)),
+                     "ff_platform_px_s": _f(getattr(out, "ff_platform_px_s", None)),
++                    # Which tier fed the feedforward, and how much evidence was
++                    # behind it. Without this a run cannot distinguish lag from
++                    # pure-P frames from lag in the control law itself.
++                    "ff_source": getattr(out, "ff_source", "est"),
++                    "ff_points": int(getattr(out, "ff_points", 0) or 0),
+                     # COMMANDED rate at box time, not achieved -- see types.py.
+                     "omega_at_box": [_f(getattr(out, "omega_at_box_a", None)),
+                                      _f(getattr(out, "omega_at_box_b", None))],
+--- turret_host/app.py
++++ turret_host/app.py
+@@ -85,6 +85,7 @@
+ # and silently writing no step_check.json at all. It is safe here: unlike
+ # `cameras` it pulls only stdlib and turret_host.config, no cv2, no torch.
+ from turret_host import step_integrity                             # noqa: E402
++from turret_host.flowvel import FlowVelocity                       # noqa: E402
+ 
+ #: `imu fast` -> "IMUF gx gy gz pitch roll". Groups 4 and 5 are the angles.
+ _IMUF_RE = re.compile(r"IMUF\s+([-+\d.]+)\s+([-+\d.]+)\s+([-+\d.]+)\s+"
+@@ -623,12 +624,25 @@
+ 
+         # -- hand-offs ---------------------------------------------------
+         self.narrow_slot = Slot()
++        #: Last flow velocity and which tier produced it, handed from the
++        #: detect thread to the control thread. Plain assignment of a tuple is
++        #: atomic enough here: the control thread wants the most recent value
++        #: and a one-frame-old one is not a fault.
++        self._ff_velocity = (0.0, 0.0)
++        self._ff_source = "none"
++        self._ff_points = 0
++        self._ff_ms = 0.0
+         self.wide_slot = Slot()
+         self.det_slot = Slot()          # DetectedFrame, narrow
+         # Wide detections now reach the TRACKER as a fallback, not just the
+         # display -- see _tracker_loop. They still never gate the beam.
+         self.wide_det_slot = Slot()     # DetectedFrame, wide (display + fallback)
+         self._w2n = WideToNarrow.load()
++        #: Target image velocity for the FEEDFORWARD only, from optical flow on
++        #: the box patch. Lives on the detect thread, which is the only place
++        #: the raw narrow frame and the box exist together. See flowvel.py.
++        self.flowvel = FlowVelocity()
++
+         # Measured attitude, from gravity. (t, pitch_deg, roll_deg).
+         self.attitude_slot = Slot()
+         # Unit gravity vector at the datum, captured when homing completes.
+@@ -1802,6 +1816,23 @@
+                 # actually goes out.
+                 est = self.tracker.update(item.result.targets,
+                                           item.result.frame_t)
++                # FLOW GOES HERE, NOT IN THE CONTROL THREAD.
++                #
++                # This is the only point that has the RAW narrow frame and the
++                # box for the same instant. `item.frame.image` is the
++                # unannotated capture -- the display overlay is drawn later,
++                # onto a copy, and tracking the overlay would feed the loop its
++                # own output. Measured cost 2.78 ms median (cropped LK), inside
++                # the 33 ms frame period alongside the 10.7 ms detector.
++                ffv = self.flowvel.update(
++                    item.frame.image if item.frame is not None else None,
++                    (est.box.x1, est.box.y1, est.box.x2, est.box.y2)
++                    if est.box is not None else None,
++                    item.result.frame_t)
++                self._ff_velocity = ffv
++                self._ff_source = self.flowvel.source
++                self._ff_points = self.flowvel.points
++                self._ff_ms = self.flowvel.ms
+             else:
+                 # Detections are NOT fed to the filter before the operator
+                 # presses START. Otherwise the banner reads TRACK during the
+@@ -1811,6 +1842,13 @@
+                 if self.tracker.state is not TrackState.SEARCH:
+                     self.tracker.reset()
+                 est = self.tracker.predict_to(item.result.frame_t)
++                # Not tracking: drop the flow history too, so a velocity
++                # measured before START cannot survive into the first
++                # commanded frame.
++                self.flowvel.reset()
++                self._ff_velocity = (0.0, 0.0)
++                self._ff_source = "none"
++                self._ff_points = 0
+             self.est_slot.put(TrackedFrame(frame=item.frame, result=item.result,
+                                            estimate=est))
+ 
+@@ -2013,7 +2051,14 @@
+                 if self.controller.ready:
+                     out = self.controller.compute(
+                         est, now,
+-                        pose=self._pose if pose_trusted else None)
++                        pose=self._pose if pose_trusted else None,
++                        # The feedforward's velocity, from optical flow on the
++                        # box patch rather than from differencing box centres.
++                        # `est` still supplies the aim point and everything
++                        # else; this replaces the feedforward term alone.
++                        ff_velocity=self._ff_velocity,
++                        ff_source=self._ff_source,
++                        ff_points=self._ff_points)
+                     # WIDE-SOURCED SLEW CAP -- see config.WIDE_MAX_MOTOR_RATE.
+                     # The handoff box is stale and coarse; approach at a rate
+                     # the narrow camera can still detect through, so it can

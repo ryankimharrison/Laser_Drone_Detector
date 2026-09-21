@@ -151,10 +151,23 @@ def capture(link, level_ok: Optional[bool] = None) -> Optional[dict]:
             "level_ok": level_ok}
 
 
-def verify(link, datum: Optional[dict], rate: int = 800) -> Optional[dict]:
+def verify(link, datum: Optional[dict], rate: Optional[int] = None) -> Optional[dict]:
     """Rewind to the datum and measure what came back. Returns a report."""
     if not datum:
         return None
+    if rate is None:
+        rate = int(800 * config.MICROSTEP_DIVISOR / 16)
+    if config.DYNAMIC_MICROSTEPPING:
+        # Firmware restores 1/16 when leaving velocity mode. Read counters
+        # only AFTER that restoration, before subtracting the fine-step datum.
+        try:
+            link.command("velmode off", timeout=3.0)
+            st = link.state()
+            if any(st.get("axes", {}).get(n, {}).get("microstep") != 16
+                   for n in ("pan", "tilt")):
+                return {"error": "dynamic rewind refused: board did not return to 1/16"}
+        except Exception as exc:
+            return {"error": "dynamic rewind refused: %s" % exc}
     p0 = datum["positions"]
     p1 = _positions(link)
     if p1 is None:
@@ -191,7 +204,8 @@ def verify(link, datum: Optional[dict], rate: int = 800) -> Optional[dict]:
         if delta[k] == 0:
             continue
         back = -delta[k]
-        over = LASH_STEPS if back > 0 else -LASH_STEPS
+        lash = int(LASH_STEPS * config.MICROSTEP_DIVISOR / 16)
+        over = lash if back > 0 else -lash
         link.command("move %s %d %d" % (k, back + over, rate), timeout=60.0)
         time.sleep(0.15)
         link.command("move %s %d %d" % (k, -over, rate), timeout=60.0)

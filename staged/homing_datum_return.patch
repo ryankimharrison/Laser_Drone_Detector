@@ -1,0 +1,205 @@
+# Patch for turret_host/homing.py -- iteration 17 bundle.
+# Generated against the live file INCLUDING the LinkError import
+# and both LinkError catches.
+# Apply:  git apply -p0 staged/homing_datum_return.patch
+#
+--- turret_host/homing.py
++++ turret_host/homing.py (iter17)
+@@ -133,6 +133,22 @@
+ 
+ # Post-level residual tilt we are willing to call "level".
+ PITCH_VERIFY_TOL_DEG = 0.5
++
++# How far the final pose may sit from the STORED HOME DATUM, in degrees.
++#
++# Separate from PITCH_VERIFY_TOL_DEG, and the distinction is the whole point.
++# PITCH_VERIFY_TOL_DEG asks "are we at true vertical", which on this rig is a
++# question whose answer is permanently NO: measured 2026-09-20, home sits
++# 4.40 deg from vertical and ~2 deg of that is ROLL, which the mechanism has
++# no axis to remove. Checked against vertical, every run reports a failed
++# datum -- and a warning that fires every time is one nobody reads.
++#
++# This asks the question that actually matters, "are we where home is",
++# against a datum the machine measured for itself. 1.0 deg sits above the
++# accelerometer's 0.76 deg/sample noise and below the ~2 deg lash, so it
++# catches a datum that has genuinely moved without crying wolf about the
++# rig's normal resting attitude.
++DATUM_VERIFY_TOL_DEG = 1.0
+ 
+ # ==========================================================================
+ #   The yaw reference -- persisted, and loaded WITHOUT being asked
+@@ -288,6 +304,10 @@
+     #: Homing._verify_datum().
+     datum_verified: bool = False
+     datum_residual_deg: float = float("nan")
++    #: Degrees from the board's STORED HOME datum, or None if the board has
++    #: none. This, not datum_residual_deg, is what `datum_verified` reflects
++    #: whenever it is available -- see Homing._verify_datum().
++    datum_error_deg: Optional[float] = None
+     #: Degrees of travel left to each measured soft limit, from this datum.
+     soft_limit_margin_deg: dict = field(default_factory=dict)
+ 
+@@ -299,10 +319,19 @@
+         lines.append("  pitch tilt %+.2f deg from gravity%s"
+                      % (self.pitch_tilt_deg,
+                         "" if self.pitch_datum_ok else "   *** OUT OF TOL ***"))
+-        lines.append("  datum      %s -- %.2f deg from vertical, re-measured "
+-                     "after sethome"
+-                     % ("VERIFIED" if self.datum_verified
+-                        else "*** NOT VERIFIED ***", self.datum_residual_deg))
++        if self.datum_error_deg is not None:
++            lines.append("  datum      %s -- %.2f deg from STORED HOME "
++                         "(%.2f from vertical, which is where home lives)"
++                         % ("VERIFIED" if self.datum_verified
++                            else "*** NOT VERIFIED ***",
++                            self.datum_error_deg, self.datum_residual_deg))
++        else:
++            lines.append("  datum      %s -- %.2f deg from vertical, "
++                         "re-measured after sethome (board has no stored "
++                         "home)"
++                         % ("VERIFIED" if self.datum_verified
++                            else "*** NOT VERIFIED ***",
++                            self.datum_residual_deg))
+         lines.append("  yaw ref    %s"
+                      % {"stored": "loaded from disk -- yaw is ABSOLUTE",
+                         "caller": "supplied by the caller",
+@@ -906,6 +935,25 @@
+         else:
+             self._say("pitch verified against gravity: %+.2f deg" % tilt, 0.95)
+ 
++        # RETURN TO THE STORED HOME DATUM, if the board has one.
++        #
++        # This is the step that makes PITCH repeatable across a power cycle.
++        # Everything above establishes a datum from physics and then calls
++        # wherever it ended up "zero"; `dzero` writes that into a counter
++        # that dies at reset. Yaw survives because the motor field names a
++        # real pose. Pitch had no equivalent until the board learned to store
++        # home as a gravity VECTOR -- see firmware datum.py.
++        #
++        # PLACED HERE, AFTER THE YAW DATUM, ON PURPOSE. The error metric is
++        # the angle between measured gravity and the stored vector, and that
++        # is NOT yaw-invariant: yaw rotates the IMU about the payload's own
++        # +Z, so the same pitch reads a different vector at a different yaw.
++        # The board refuses `datum go` outside a 2 deg window around the
++        # capture yaw rather than let a pitch loop chase a yaw error it
++        # cannot reduce. By this line the lash preload has already put us at
++        # the yaw datum, so that window is satisfied.
++        self._return_to_datum()
++
+         # dzero BEFORE sethome so the datum is literally (0, 0): the travel
+         # limits in config.py are quoted from the datum, and a datum you cannot
+         # name zero is not much of a datum.
+@@ -1051,10 +1099,49 @@
+             datum_verified=verify["verified"],
+             datum_residual_deg=verify["residual"],
+             soft_limit_margin_deg=verify["margins"],
++            datum_error_deg=verify.get("datum_error"),
+         )
+         self._say("homed: pitch %+.3f yaw %+.3f (%s) in %.1f s"
+                   % (pitch_home, yaw_home, status, result.elapsed_s), 1.0)
+         return result
++
++    def _return_to_datum(self) -> None:
++        """Drive pitch back to the board's stored home datum, if it has one.
++
++        NEVER FATAL. A board with no datum -- or firmware predating it --
++        homes exactly as it did before and says so. The pitch datum is then
++        "wherever levelling left us", which is the old behaviour: still a
++        datum, just not a repeatable one.
++        """
++        try:
++            reply = self._cmd("datum go", T_LEVEL)
++        except (HomingError, LinkError) as exc:
++            text = str(exc).lower()
++            if "unknown command" in text:
++                self._say("the board has no `datum` command: this firmware "
++                          "predates the stored home datum, so pitch is "
++                          "wherever levelling left it and will NOT come back "
++                          "to the same pose after a reset.", 0.93)
++            elif "no datum stored" in text:
++                self._say("no home datum stored on the board. Pitch will not "
++                          "return to the same pose next boot -- put the "
++                          "payload where home should be and run `datum set` "
++                          "once.", 0.93)
++            else:
++                # A real failure of a real mechanism. Loud, but not fatal:
++                # this run still has a gravity pitch datum and a yaw datum.
++                self._say("could NOT return to the home datum (%s). The datum "
++                          "this run sets is the pose levelling reached, not "
++                          "stored home." % exc, 0.93)
++            return
++        m = re.search(r"returned to the HOME DATUM:\s+" + _NUM + r"\s+deg",
++                      reply or "")
++        if m:
++            self._say("returned to the stored home datum: %.2f deg from it"
++                      % float(m.group(1)), 0.93)
++        else:
++            self._say("`datum go` completed but reported no residual; "
++                      "treating the return as unconfirmed.", 0.93)
+ 
+     # ------------------------------------------- 7. verify against gravity
+ 
+@@ -1081,7 +1168,8 @@
+         limits FROM THIS DATUM, which is the number that says whether the
+         working envelope is usable at all.
+         """
+-        out = {"verified": False, "residual": float("nan"), "margins": {}}
++        out = {"verified": False, "residual": float("nan"), "margins": {},
++               "datum_error": None}
+         try:
+             reply = self._cmd("imu fast", T_MAG)
+         except (HomingError, LinkError) as exc:
+@@ -1108,7 +1196,27 @@
+         residual = math.degrees(math.acos(max(-1.0, min(1.0, math.cos(
+             math.radians(pitch)) * math.cos(math.radians(roll))))))
+         out["residual"] = residual
+-        out["verified"] = residual <= PITCH_VERIFY_TOL_DEG
++
++        # WHICH REFERENCE? Ask the board for its stored home datum and verify
++        # against THAT when it has one. Vertical is the wrong reference on
++        # this rig: home is 4.40 deg off it, ~2 deg of that unactuatable, so
++        # a vertical check fails every run. Falls back to vertical only when
++        # the board has no datum, which is the pre-datum behaviour.
++        datum_err = None
++        try:
++            dreply = self._cmd("datum", T_STATE)
++            dm = re.search(r"deg from vertical,\s+" + _NUM
++                           + r"\s+deg from the datum", dreply or "")
++            if dm:
++                datum_err = float(dm.group(1))
++        except (HomingError, LinkError):
++            datum_err = None
++
++        if datum_err is not None:
++            out["datum_error"] = datum_err
++            out["verified"] = datum_err <= DATUM_VERIFY_TOL_DEG
++        else:
++            out["verified"] = residual <= PITCH_VERIFY_TOL_DEG
+ 
+         if self.skip_level:
+             out["verified"] = False
+@@ -1116,10 +1224,24 @@
+                       "no gravity datum to check against (residual reads "
+                       "%.2f deg from vertical, pitch %+.2f roll %+.2f)"
+                       % (residual, pitch, roll), 0.98)
++        elif out["verified"] and datum_err is not None:
++            self._say("datum VERIFIED against STORED HOME: %.2f deg from it "
++                      "(inside %.2f). The pose is %.2f deg from vertical, "
++                      "which is where this rig's home lives -- expected, not "
++                      "an error."
++                      % (datum_err, DATUM_VERIFY_TOL_DEG, residual), 0.98)
+         elif out["verified"]:
+             self._say("datum VERIFIED against gravity: %.2f deg from vertical "
+                       "(pitch %+.2f, roll %+.2f), inside %.2f"
+                       % (residual, pitch, roll, PITCH_VERIFY_TOL_DEG), 0.98)
++        elif datum_err is not None:
++            self._say("DATUM IS %.2f deg FROM STORED HOME (tolerance %.2f). "
++                      "That is not the rig's resting tilt -- it is measured "
++                      "against the home the machine recorded for itself, so "
++                      "the payload did NOT come back to the same pose. The "
++                      "lash is ~2 deg at 20-40 deg pitch; check the approach "
++                      "direction and whether anything has slipped."
++                      % (datum_err, DATUM_VERIFY_TOL_DEG), 0.98)
+         else:
+             self._say("DATUM IS %.2f deg FROM VERTICAL (pitch %+.2f, roll "
+                       "%+.2f), past the %.2f tolerance. Dead reckoning, both "

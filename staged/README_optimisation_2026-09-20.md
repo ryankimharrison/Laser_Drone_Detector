@@ -295,3 +295,84 @@ excluded, which is why the flow column has a smaller n than the others.
 `raw/` frames are used, never `frames/` — the latter has the box and the aim
 cross burned in, and tracking the overlay would measure the estimate, which is
 the thing under test. Verified by eye on f005394.
+
+
+---
+
+## Item 6 — optical flow as the feedforward velocity source (STAGED)
+
+    staged/flowvel.py                                  -> turret_host/flowvel.py  (NEW FILE, copy it)
+    staged/host_2026-09-20_item6-flow-feedforward.patch -> config, control, types, telemetry, app
+
+Applies clean on top of the live tree (which already has items 1+4 and the
+FIRE_BOX_ASPECT_MIN 0.30 change) and reproduces all five staged files
+byte-for-byte. **`FEEDFORWARD_GAIN` stays 0.0** — this ships the source and the
+logging only.
+
+### Where it sits, and what it deliberately does not touch
+
+The flow measurement happens on the **detect thread**, beside `tracker.update`,
+because that is the only point where the raw narrow frame and the box exist for
+the same instant. It feeds `Controller.compute(ff_velocity=...)`, which replaces
+`est.du/dv` **in the feedforward term alone**. The filter remains the estimator
+for the aim point, the association gate and everything downstream; flow is not a
+measurement into the Kalman and must not become one without a separate decision.
+
+`ff_velocity=None` keeps the old behaviour, and `(0.0, 0.0)` is deliberately
+*not* the same thing: that is the fallback tier saying "pure P this frame", and
+it must not be quietly replaced by `est.du/dv` — the noisy source the change
+exists to stop using.
+
+### The fallback ladder, and why the floor is pure P
+
+| tier | condition | feedforward |
+|---|---|---|
+| `flow` | all three guards pass | measured velocity |
+| `held` | flow silent, within `FLOW_HOLD_S` | last value, **ramped linearly to zero** |
+| `none` | beyond the hold | 0.0 — pure P |
+
+Not the filter and not box-differencing at the bottom: the filter's own
+frame-to-frame jump is still 85/250 px/s median/p90 on the fast run, and the
+blurred frames where flow goes silent are exactly where that would flip sign.
+Pure P costs bounded lag; a wrong-signed feedforward does not. The ramp is
+linear rather than flat because dropping a held velocity to zero puts a *step*
+into the feedforward, which is the same shape as the fault being removed.
+
+### Cost, measured before the code was written
+
+Full-frame `goodFeaturesToTrack` + LK + backward check is **27.5 ms median** —
+the mask does not stop corner detection scanning the whole image. Cropping to
+the box + 35% first is **2.78 ms**, and returns the same answer: agreement with
+the full-frame version over 220 frames is a median **0.0003 px**. End to end in
+the module, including the full-frame BGR→GRAY, **3.06 ms median / 3.67 p90**
+against a 33 ms frame period and a 10.7 ms detector.
+
+### Behavioural tests, on real frames, no hardware and no GUI
+
+| check | result |
+|---|---|
+| flow answers on real frames | 88% (221/250) |
+| first frame cannot produce flow | none |
+| cost per frame | 3.06 ms median |
+| velocities plausible | median 113 px/s, max 538 |
+| tier 1 → 2 → 3 ladder | flow → held → none |
+| held decays, not flat | 177 → 93 → 8 → 0 px/s |
+| hold length | exactly 2 frames |
+| `reset()` drops history | yes |
+
+**One bug the tests caught:** `FLOW_HOLD_S = 0.066` gave a hold of *one* frame,
+not two — at exactly two frame periods the second frame lands on the boundary
+and fails `age <= FLOW_HOLD_S`. Now 0.070, which holds two frames and still
+excludes a third at 100 ms.
+
+### New telemetry
+
+`cmd.ff_source` (`flow` / `held` / `none` / `est`) and `cmd.ff_points`. Without
+these an AAR cannot tell lag caused by pure-P frames from lag in the control
+law. Expect roughly 85–96% `flow`, the rest concentrated on fast, blurred
+frames.
+
+### What still needs the rig
+
+The gain ramp. A wrong feedforward cannot be scored by replay — the turret would
+have moved differently — so 0 → 0.5 → 1.0 is a hardware exercise with Ryan.

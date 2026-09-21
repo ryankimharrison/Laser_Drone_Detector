@@ -1,0 +1,77 @@
+--- turret_host/app.py
++++ turret_host/app.py
+@@ -2581,6 +2581,33 @@
+                  "narrow camera for %.0f s. Configured rotation is %d deg."
+                  % (seconds, self.face_detector.rotation_deg), "warn")
+ 
++        # SAVE WHAT IT SCORED, OR THE VERDICT CANNOT BE AUDITED.
++        #
++        # run_2026-09-20_183021 refused ARM at 0/38 and the frames were gone:
++        # the flight recorder runs from launch (imu.jsonl covers the whole
++        # session) but the control loop publishes nothing until START, so the
++        # 6 s before it leaves no images at all. "0/38" then cannot be told
++        # apart from "nobody stood in front of the camera", which is exactly
++        # the question that mattered -- and it is a SAFETY gate.
++        #
++        # Cheap on purpose: 38 JPEGs over 6 s, written on the thread that is
++        # already blocking for those 6 s. Nothing here may raise: this runs
++        # inside on_arm(), and a failed write must never be the reason the beam
++        # is refused or permitted.
++        # Imported here, not in the loop: `verdict` below needs it even when
++        # the loop never ran (frames = 0), which is precisely the case worth
++        # recording.
++        import json as _json
++        shot_dir = None
++        try:
++            base = (Path(self._run_dir) if self._run_dir is not None
++                    else Path("diag") / "face_checks")
++            shot_dir = base / ("face_check_%s" % time.strftime("%H%M%S"))
++            shot_dir.mkdir(parents=True, exist_ok=True)
++        except Exception:                                  # noqa: BLE001
++            shot_dir = None
++        scored = []
++
+         deadline = _now() + float(seconds)
+         hits = wins = losses = frames = 0
+         best_here = best_there = 0.0
+@@ -2602,6 +2629,16 @@
+                     wins += 1
+                 elif there > here:
+                     losses += 1
++            if shot_dir is not None:
++                try:
++                    import cv2
++                    name = "%03d_here%.3f_there%.3f.jpg" % (frames, here, there)
++                    cv2.imwrite(str(shot_dir / name), frame.image)
++                    scored.append({"n": frames, "frame_index": frame.index,
++                                   "here": float(here), "there": float(there),
++                                   "file": name})
++                except Exception:                          # noqa: BLE001
++                    shot_dir = None                        # stop trying, keep checking
+ 
+         ok = hits >= int(need) and wins > losses
+         self._face_orientation_detail = (
+@@ -2610,6 +2647,23 @@
+             % (hits, frames, self.face_detector.rotation_deg, best_here,
+                best_there, losses, wins))
+         self._face_orientation_ok = ok
++        if shot_dir is not None:
++            try:
++                with open(shot_dir / "verdict.json", "w", encoding="utf-8") as fh:
++                    _json.dump({"passed": bool(ok), "hits": hits, "frames": frames,
++                               "need": int(need), "seconds": float(seconds),
++                               "rotation_deg": self.face_detector.rotation_deg,
++                               "face_conf": config.FACE_CONF,
++                               "best_here": float(best_here),
++                               "best_there": float(best_there),
++                               "wins": wins, "losses": losses,
++                               "detail": self._face_orientation_detail,
++                               "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
++                                                    time.gmtime()),
++                               "scored": scored}, fh, indent=2)
++                self.log("face check frames saved -> %s" % shot_dir, "info")
++            except Exception:                              # noqa: BLE001
++                pass
+         if ok:
+             self.log("FACE INTERLOCK VERIFIED: %s" % self._face_orientation_detail,
+                      "good")

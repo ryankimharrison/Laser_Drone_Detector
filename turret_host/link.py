@@ -51,6 +51,7 @@ if __package__ in (None, ""):                                    # noqa: E402
     _sys.path.insert(0, _os.path.dirname(_here))
 
 import math
+import re
 import threading
 import time
 
@@ -334,6 +335,7 @@ class TurretLink:
         # a machine with no board attached.
         self._forced_port = port
         self._on_message = on_message      # optional progress sink for the GUI
+        self.last_gear_report = None       # last ACK, includes its own timestamp
 
         self._ser = None
         self._port = ""
@@ -1275,7 +1277,8 @@ class TurretLink:
                 and not self._vel_mode_entered
                 and (rate_a != 0.0 or rate_b != 0.0)):
             self._resync_vel_dir()
-        cmd = "vel %.1f %.1f" % (rate_a, rate_b)
+        verb = "vel16" if config.DYNAMIC_MICROSTEPPING else "vel"
+        cmd = "%s %.1f %.1f" % (verb, rate_a, rate_b)
         t0 = time.perf_counter()
         reply = self._transact(cmd, timeout=_VEL_TIMEOUT_S,
                                settle=_VEL_SETTLE_S)
@@ -1285,6 +1288,14 @@ class TurretLink:
                             % (cmd, _VEL_TIMEOUT_S * 1000.0))
         if "ok" not in reply:
             raise LinkError("board rejected %r: %s" % (cmd, reply.strip()))
+        if config.DYNAMIC_MICROSTEPPING:
+            gear = re.search(r"\bMS=(8|16) SH=(\d+) GC=([01])\b", reply)
+            if gear is None:
+                raise LinkError("dynamic velocity ACK missing gear metadata")
+            self.last_gear_report = {
+                "ack_t": time.perf_counter(), "microstep": int(gear[1]),
+                "shifts": int(gear[2]), "pulse_capped": bool(int(gear[3])),
+                "wire_divisor": 16, "rate_a16": float(rate_a), "rate_b16": float(rate_b)}
         with self._stat_lock:
             self._vel_mode_entered = True
             self._motors_live = True
@@ -1318,7 +1329,8 @@ class TurretLink:
         """
         for ra, rb in ((-_DIR_RESYNC_RATE, -_DIR_RESYNC_RATE),
                        (_DIR_RESYNC_RATE, _DIR_RESYNC_RATE)):
-            cmd = "vel %.1f %.1f" % (ra, rb)
+            verb = "vel16" if config.DYNAMIC_MICROSTEPPING else "vel"
+            cmd = "%s %.1f %.1f" % (verb, ra, rb)
             reply = self._transact(cmd, timeout=_VEL_TIMEOUT_S,
                                    settle=_VEL_SETTLE_S)
             if reply is None:

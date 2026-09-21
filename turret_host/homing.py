@@ -65,6 +65,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from turret_host import config
+from turret_host.link import LinkError   # 2026-09-20: slimit probe tolerance
 
 
 # ==========================================================================
@@ -132,6 +133,43 @@ YAW_LIMIT_MARGIN_DEG = 5.0
 
 # Post-level residual tilt we are willing to call "level".
 PITCH_VERIFY_TOL_DEG = 0.5
+
+# ==========================================================================
+#   The yaw reference -- persisted, and loaded WITHOUT being asked
+# ==========================================================================
+# The magnetometer sweep can only produce an ABSOLUTE yaw datum if it has a
+# stored field value naming a pose. Without one, _solve_datum() falls back to
+# "the middle of the arc is zero", which is arbitrary and different every
+# boot -- so the sweep runs, costs 20 s, and buys nothing.
+#
+# That reference has existed on disk since 2026-09-19 and was never read: the
+# only way in was `--yaw-reference <float>` typed on the command line, and
+# app.py defaulted it to None. Every run since has swept the field and then
+# thrown the answer away. Loading it here, by default, is what makes "use the
+# magnetometer every time" mean something rather than just cost time.
+YAW_REFERENCE_PATH = Path(__file__).resolve().parent / "calibration" / "yaw_reference.json"
+
+
+def load_yaw_reference(path: Optional[Path] = None) -> Optional[float]:
+    """The stored `my` LSB value that defines yaw zero, or None."""
+    p = Path(path) if path is not None else YAW_REFERENCE_PATH
+    try:
+        rec = json.loads(p.read_text())
+        return float(rec["yaw_reference_lsb"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_yaw_reference(value: float, slope: Optional[float] = None,
+                       path: Optional[Path] = None) -> Path:
+    """Persist a reference so the NEXT run comes up absolutely homed."""
+    p = Path(path) if path is not None else YAW_REFERENCE_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(
+        {"yaw_reference_lsb": float(value),
+         "slope_lsb_per_deg": None if slope is None else float(slope),
+         "written": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=2))
+    return p
 
 # Timeouts, seconds. `level` iterates up to ten times and each iteration
 # averages twelve accelerometer samples with the payload stopped, so it is
@@ -241,6 +279,17 @@ class HomingResult:
     elapsed_s: float
     messages: List[str] = field(default_factory=list)
     samples: List[MagSample] = field(default_factory=list)
+    #: Where the yaw reference came from: "stored" (loaded from disk, so yaw
+    #: is absolute), "caller" (an explicit value) or "none" (this run could
+    #: only ESTABLISH one, and yaw is arbitrary until the next home).
+    ref_source: str = "none"
+    #: Gravity re-measured AFTER dzero/sethome. `pitch_datum_ok` above is the
+    #: pre-dzero preload check and answers a different question -- see
+    #: Homing._verify_datum().
+    datum_verified: bool = False
+    datum_residual_deg: float = float("nan")
+    #: Degrees of travel left to each measured soft limit, from this datum.
+    soft_limit_margin_deg: dict = field(default_factory=dict)
 
     def summary(self) -> str:
         lines = ["homing %s" % ("OK" if self.ok else "FAILED")]
@@ -250,6 +299,19 @@ class HomingResult:
         lines.append("  pitch tilt %+.2f deg from gravity%s"
                      % (self.pitch_tilt_deg,
                         "" if self.pitch_datum_ok else "   *** OUT OF TOL ***"))
+        lines.append("  datum      %s -- %.2f deg from vertical, re-measured "
+                     "after sethome"
+                     % ("VERIFIED" if self.datum_verified
+                        else "*** NOT VERIFIED ***", self.datum_residual_deg))
+        lines.append("  yaw ref    %s"
+                     % {"stored": "loaded from disk -- yaw is ABSOLUTE",
+                        "caller": "supplied by the caller",
+                        "none": "none stored -- yaw is ARBITRARY this run"}
+                     .get(self.ref_source, self.ref_source))
+        if self.soft_limit_margin_deg:
+            lines.append("  soft room  %s"
+                         % ", ".join("%s %.1f deg" % (k, v) for k, v
+                                     in sorted(self.soft_limit_margin_deg.items())))
         lines.append("  gyro bias  %+.2f %+.2f %+.2f deg/s" % self.gyro_bias_dps)
         if self.yaw_fit is not None:
             f = self.yaw_fit
@@ -289,6 +351,10 @@ _TILT_RE = re.compile(r"tilt now\s+" + _NUM + r"\s+pitch,\s*" + _NUM + r"\s+roll
 _BIAS_RE = re.compile(r"gyro bias.*?\(" + _NUM + r",\s*" + _NUM + r",\s*"
                       + _NUM + r"\s+deg/s\)", re.DOTALL)
 _HOME_RE = re.compile(r"home set: pitch\s+" + _NUM + r"\s+yaw\s+" + _NUM)
+#: "IMUF gx gy gz pitch roll ms" -- the cheap machine-readable IMU read. Five
+#: leading fields, matched unanchored so the appended tick cannot break this
+#: the way prefixing a field would. Same shape app.py and telemetry.py use.
+_IMUFAST_RE = re.compile(r"IMUF\s+" + r"\s+".join([_NUM] * 5))
 _SENS_RE = re.compile(r"measured\s+" + _NUM + r"\s+deg of tilt per deg")
 
 
@@ -401,6 +467,8 @@ class Homing:
                  sweep_step_deg: float = SWEEP_STEP_DEG,
                  fast: bool = False,
                  skip_level: bool = False,
+                 auto_save_ref: bool = True,
+                 ref_path: Optional[Path] = None,
                  cancel: Optional[Callable[[], bool]] = None):
         self.link = link
         self._progress = progress
@@ -430,6 +498,17 @@ class Homing:
         # the base frame, so "my == this" names a real physical pose -- but
         # only once someone has measured it. Without it, the first run can
         # establish the reference and nothing more; see _solve_datum().
+        #
+        # LOADED FROM DISK when the caller does not supply one. Until now the
+        # only way in was an explicit float, so the reference saved on
+        # 2026-09-19 sat unused and every run swept the field and discarded
+        # the answer. See YAW_REFERENCE_PATH.
+        self.ref_path = Path(ref_path) if ref_path is not None else YAW_REFERENCE_PATH
+        self.auto_save_ref = bool(auto_save_ref)
+        self.ref_source = "caller"
+        if yaw_reference_lsb is None:
+            yaw_reference_lsb = load_yaw_reference(self.ref_path)
+            self.ref_source = "stored" if yaw_reference_lsb is not None else "none"
         self.yaw_reference_lsb = yaw_reference_lsb
         self.sweep_half_deg = float(sweep_half_deg)
         self.sweep_step_deg = float(sweep_step_deg)
@@ -844,6 +923,30 @@ class Homing:
         t0 = time.monotonic()
         self.messages = []
 
+        # THE MAGNETOMETER SWEEP IS NOT OPTIONAL ANY MORE.
+        #
+        # `fast` skipped it to save ~20 s of a ~40 s run, on the argument that
+        # without a stored reference the sweep's datum is arbitrary anyway.
+        # That argument was true only because the stored reference was never
+        # being loaded (see YAW_REFERENCE_PATH). With it loaded, the sweep is
+        # the ONLY absolute yaw reference this machine has -- gravity cannot
+        # see yaw, and the step counter is relative to whatever pose the last
+        # boot left behind. Skipping it means yaw is arbitrary, which means
+        # the yaw travel limit that protects the payload wiring loom is
+        # measured from nowhere.
+        #
+        # Refused rather than quietly ignored: a caller that asked for a fast
+        # home and silently got a slow one would be a worse surprise than an
+        # error, and a caller that asked for it and got an unhomed yaw without
+        # noticing is how we got here.
+        if self.fast:
+            raise HomingError(
+                "fast home is no longer available: it skips the magnetometer "
+                "sweep, which is the only absolute yaw reference on this "
+                "machine. The sweep costs ~20 s and now actually produces a "
+                "datum, because the stored reference at %s is loaded by "
+                "default. Drop --fast-home." % self.ref_path)
+
         self._confirm_idle()
         bias = self._gyro_cal()
         if self.skip_level:
@@ -854,52 +957,6 @@ class Homing:
                       "loop closes on pixels, not on this.", 0.30)
         else:
             self._level()
-
-        if self.fast:
-            # FAST: pitch datum from gravity, yaw datum from the current pose.
-            #
-            # This skips the 33-point magnetometer sweep, which is ~20 s of the
-            # ~40 s run. It costs NOTHING WE ARE USING: without a persisted
-            # yaw_reference_lsb the sweep's own _solve_datum() falls back to
-            # "current pose = yaw zero" anyway and reports the datum as
-            # arbitrary. Doing that directly is the same answer, sooner.
-            #
-            # What it DOES cost: the ripple-phase lost-step check, and any hope
-            # of absolute yaw. So it is wrong for a run that needs to come back
-            # to a pose established on a previous boot -- use a full home and
-            # --save-ref for that. Pitch is unaffected: gravity still sets it.
-            if self.yaw_reference_lsb is not None:
-                self._say("fast home: IGNORING the stored yaw reference. A "
-                          "real yaw datum needs the sweep; run without --fast-home.",
-                          0.90)
-            _pitch_now, yaw_now = self._position()
-            pitch_home, yaw_home, tilt, pitch_ok = self._approach_and_home(yaw_now)
-            took = time.monotonic() - t0
-            self._say("fast home complete in %.1f s: pitch from gravity, yaw "
-                      "arbitrary (current pose)" % took, 1.0)
-            return HomingResult(
-                ok=True,
-                yaw_homed=False,
-                yaw_status="UNHOMED (fast home: magnetometer sweep skipped)",
-                datum_pitch_deg=pitch_home,
-                datum_yaw_deg=yaw_home,
-                datum_yaw_counter_deg=yaw_now,
-                pitch_tilt_deg=tilt,
-                pitch_datum_ok=pitch_ok,
-                gyro_bias_dps=bias,
-                mag_saturated=False,
-                # No sweep ran, so there are no field samples and no fit. These
-                # are reported as zero/None rather than omitted, so a consumer
-                # reading them gets "nothing was measured" instead of a stale
-                # value from a previous run.
-                max_abs_component_lsb=0.0,
-                field_magnitude_lsb=0.0,
-                yaw_reference_lsb=None,
-                yaw_fit=None,
-                elapsed_s=took,
-                messages=list(self.messages),
-                samples=[],
-            )
 
         saturated = self._sweep()
 
@@ -943,12 +1000,34 @@ class Homing:
 
         pitch_home, yaw_home, tilt, pitch_ok = self._approach_and_home(yaw_datum)
 
+        # PERSIST THE REFERENCE THIS RUN ESTABLISHED.
+        #
+        # _solve_datum() returns a fresh reference on the first run of a
+        # machine, reports "REFERENCE SET", and until now that value went
+        # nowhere unless someone ran homing.py by hand with --save-ref. So
+        # every startup re-established a brand new arbitrary origin and the
+        # 20 s sweep never accumulated into anything. Written only when the
+        # run actually produced one and there was none stored, so a good
+        # reference is never silently overwritten by a worse one.
+        if (self.auto_save_ref and ref is not None
+                and self.ref_source == "none" and not saturated):
+            try:
+                p = save_yaw_reference(ref, fit.slope_lsb_per_deg, self.ref_path)
+                self._say("yaw reference %.2f LSB SAVED to %s -- the next "
+                          "home will come up on an absolute yaw datum instead "
+                          "of an arbitrary one." % (ref, p), 0.96)
+            except OSError as exc:
+                self._say("could not save the yaw reference (%s); yaw will be "
+                          "arbitrary again next boot" % exc, 0.96)
+
         # Re-express the ripple peak in post-dzero coordinates so that
         # lost_step_check speaks the same frame the rest of the stack uses
         # from here on.
         self._datum_yaw_counter = yaw_datum
         fit.ripple_peak_yaw_deg = _wrap(fit.ripple_peak_yaw_deg - yaw_datum,
                                         fit.ripple_period_deg)
+
+        verify = self._verify_datum()
 
         result = HomingResult(
             ok=True,
@@ -968,10 +1047,110 @@ class Homing:
             elapsed_s=time.monotonic() - t0,
             messages=list(self.messages),
             samples=list(self.samples),
+            ref_source=self.ref_source,
+            datum_verified=verify["verified"],
+            datum_residual_deg=verify["residual"],
+            soft_limit_margin_deg=verify["margins"],
         )
         self._say("homed: pitch %+.3f yaw %+.3f (%s) in %.1f s"
                   % (pitch_home, yaw_home, status, result.elapsed_s), 1.0)
         return result
+
+    # ------------------------------------------- 7. verify against gravity
+
+    def _verify_datum(self) -> dict:
+        """Re-measure gravity AFTER dzero/sethome and check it agrees.
+
+        WHY A SECOND CHECK. `_approach_and_home` already reads the tilt back
+        after the lash preload -- but it does so BEFORE `dzero` and `sethome`,
+        so what it verifies is "the preload returned to where levelling left
+        us", not "the datum we just wrote is at true level". Those differ
+        whenever `level` itself settled off: the firmware minimises TOTAL tilt
+        using pitch alone, and with a 2.5 deg roll floor plus lash it can
+        settle 5-7 deg out and still report success. Everything downstream --
+        dead reckoning, the travel limits, the end-of-run step check -- is
+        quoted from the pose written here, so this is the last moment it can
+        be caught.
+
+        This measures and REPORTS. It does not move: a correction at this
+        point would invalidate the yaw datum the sweep just established, and a
+        datum that is known-wrong and labelled so is worth more than one
+        silently nudged.
+
+        It also records how much room the payload has to its measured soft
+        limits FROM THIS DATUM, which is the number that says whether the
+        working envelope is usable at all.
+        """
+        out = {"verified": False, "residual": float("nan"), "margins": {}}
+        try:
+            reply = self._cmd("imu fast", T_MAG)
+        except (HomingError, LinkError) as exc:
+            self._say("datum NOT verified: %s" % exc, 0.98)
+            return out
+        m = _IMUFAST_RE.search(reply or "")
+        if not m:
+            self._say("datum NOT verified: no IMUF line in the reply to "
+                      "'imu fast'", 0.98)
+            return out
+        pitch, roll = float(m.group(4)), float(m.group(5))
+        if pitch == 0.0 and roll == 0.0:
+            # The ADXL345 standby signature reads as perfectly level and is
+            # inside every tolerance. Treating it as a pass is exactly the bug
+            # that let a datum be set 24 deg out and called good.
+            self._say("datum NOT verified: the accelerometer read exactly "
+                      "0.00/0.00, which is its STANDBY signature, not a "
+                      "measurement.", 0.98)
+            return out
+
+        # Total angle from vertical, the same axis-agnostic quantity `level`
+        # minimises. A pitch component alone reads near zero when the tilt has
+        # landed on roll, which is precisely the 5-7 deg failure above.
+        residual = math.degrees(math.acos(max(-1.0, min(1.0, math.cos(
+            math.radians(pitch)) * math.cos(math.radians(roll))))))
+        out["residual"] = residual
+        out["verified"] = residual <= PITCH_VERIFY_TOL_DEG
+
+        if self.skip_level:
+            out["verified"] = False
+            self._say("datum NOT verified: levelling was skipped, so there is "
+                      "no gravity datum to check against (residual reads "
+                      "%.2f deg from vertical, pitch %+.2f roll %+.2f)"
+                      % (residual, pitch, roll), 0.98)
+        elif out["verified"]:
+            self._say("datum VERIFIED against gravity: %.2f deg from vertical "
+                      "(pitch %+.2f, roll %+.2f), inside %.2f"
+                      % (residual, pitch, roll, PITCH_VERIFY_TOL_DEG), 0.98)
+        else:
+            self._say("DATUM IS %.2f deg FROM VERTICAL (pitch %+.2f, roll "
+                      "%+.2f), past the %.2f tolerance. Dead reckoning, both "
+                      "travel limits and the step check are all quoted from "
+                      "this pose and now carry that offset. NOTE the roll "
+                      "component: `level` corrects with pitch alone, so a "
+                      "roll floor is irreducible and re-running will not fix "
+                      "it -- level the rig by hand."
+                      % (residual, pitch, roll, PITCH_VERIFY_TOL_DEG), 0.98)
+
+        # How much travel is left, measured, from the datum just written.
+        try:
+            reply = self._cmd("slimit", T_STATE)
+            for side, key in (("pos", "limit pos"), ("neg", "limit neg")):
+                mm = re.search(re.escape(key) + r"\s+" + _NUM, reply)
+                if mm:
+                    out["margins"][side] = float(mm.group(1)) - residual
+            if out["margins"]:
+                self._say("soft limits from this datum: %s"
+                          % ", ".join("%s %.1f deg of travel" % (k, v)
+                                      for k, v in sorted(out["margins"].items())),
+                          0.99)
+        except (HomingError, LinkError):   # _cmd raises LinkError on 'unknown command' (2026-09-20)
+            # An older firmware has no `slimit`. Not a homing failure -- the
+            # datum is established either way -- but say so, because it means
+            # the payload is running without measured crash protection.
+            self._say("the board has no `slimit` command: this firmware "
+                      "predates the IMU soft limits, so nothing but the step "
+                      "counter is protecting the payload from its frame.",
+                      0.99)
+        return out
 
     # ------------------------------------------------------ health check
 

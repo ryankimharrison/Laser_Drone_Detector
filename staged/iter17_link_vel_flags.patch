@@ -1,0 +1,45 @@
+# Patch for turret_host/link.py -- iteration 17 bundle, generated 2026-09-20.
+# Apply:  git apply staged/iter17_link_vel_flags.patch
+#
+--- turret_host/link.py
++++ turret_host/link.py (iter17)
+@@ -1285,7 +1285,38 @@
+                             % (cmd, _VEL_TIMEOUT_S * 1000.0))
+         if "ok" not in reply:
+             raise LinkError("board rejected %r: %s" % (cmd, reply.strip()))
+-        with self._stat_lock:
++        # WHAT THE FIRMWARE DID WITH THE RATE, carried on the ack.
++        #
++        # The middle of the control loop was unobservable: the host logged
++        # what it asked for and the IMU logged what happened, and nothing
++        # recorded what the board did in between. On run_2026-09-20_184448
++        # the step-count pitch clamp zeroed both motors for 7 s (146.1-153.1)
++        # on a count 70 deg wrong, and the log could not tell that from a
++        # stall. Firmware iter17 appends flag letters after "ok":
++        #     L  clamp or crash guard refused this rate
++        #     T  watchdog tripped
++        #     I  impact latched
++        # Parsed here rather than polled, because `state` during servoing is
++        # a second round trip on the one serial link and the two block each
++        # other. An older board sends a bare "ok" and every flag reads False.
++        # Find the line that CARRIES the ok, not line 0. The board can emit a
++        # one-time notice ahead of it -- the crash guard prints one when it
++        # first loads its calibration -- and assuming line 0 is the ack reads
++        # every flag as False. That is the same outcome as having no flags at
++        # all, but much harder to notice, so it is worth the loop.
++        _flags = ""
++        for _ln in (reply or "").splitlines():
++            _ln = _ln.strip()
++            if _ln.startswith("ok"):
++                _rest = _ln[2:].split()
++                _flags = _rest[0] if _rest else ""
++                if not _flags or not all(ch in "LTI" for ch in _flags):
++                    _flags = ""
++                break
++        with self._stat_lock:
++            self.vel_limited = "L" in _flags
++            self.vel_tripped = "T" in _flags
++            self.vel_impact = "I" in _flags
+             self._vel_mode_entered = True
+             self._motors_live = True
+             # What the board ACKNOWLEDGED, for stop() to confirm against. Set

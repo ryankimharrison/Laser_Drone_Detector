@@ -167,6 +167,11 @@ class PixelTracker:
         #: detection vanished, and the only trace was n_targets disagreeing
         #: with has_box, which gives a count and no distances.
         self.last_rejected_px: List[float] = []
+        #: Detections discarded this frame for being too wide to be the drone.
+        #: Counted rather than folded into last_rejected_px, because telemetry
+        #: writes that list as bare distances and an analysis expecting numbers
+        #: should keep getting numbers.
+        self.last_shape_dropped = 0
         #: How many times the track was restarted from a detection rather than
         #: corrected toward one. A climbing count during a run means the motion
         #: model is repeatedly ending up somewhere the target is not, which is
@@ -197,6 +202,14 @@ class PixelTracker:
         #: width is a LOWER BOUND on the object and cannot be ranged from.
         self._stable_at_edge: bool = False
         self._last_det: Optional[Detection] = None     # raw, for the GUI
+        #: The last ASSOCIATED detection and the time it was measured, kept
+        #: across misses so the interlock can still see it while it is fresh.
+        #: Deliberately separate from `_last_det`, which stays exactly as it
+        #: was: `_last_det` is what the association step writes every frame,
+        #: and conflating "what happened this frame" with "the most recent
+        #: measurement" is how a held value silently becomes a live one.
+        self._held_det: Optional[Detection] = None
+        self._held_det_t: Optional[float] = None
 
     # ----------------------------------------------------------------- public
 
@@ -242,6 +255,21 @@ class PixelTracker:
     # ---------------------------------------------------------------- filter
 
     def _update(self, dets: List[Detection], t: float) -> TrackEstimate:
+        # SHAPE FILTER, AT THE ONE PLACE EVERY PATH GOES THROUGH.
+        #
+        # A box much wider than tall is the hand holding the drone, not the
+        # drone -- see config.ASSOC_BOX_ASPECT_MAX. Dropping it HERE rather
+        # than inside _associate() is deliberate and was found by testing: the
+        # gate is not the only way a detection becomes the track. _update has
+        # three seed paths that bypass _associate entirely -- the first frame
+        # ever, the SEARCH re-entry, and the RESEED_AFTER_MISSES branch -- and
+        # every one of them takes max(dets, key=conf) directly. Filtering only
+        # in the gate left the reseed path free to adopt a hand-shaped box,
+        # which is exactly what it did on the recorded hand approach.
+        dropped = [d for d in dets if not self._shape_ok(d)]
+        if dropped:
+            dets = [d for d in dets if self._shape_ok(d)]
+        self.last_shape_dropped = len(dropped)
         if self._t is None:
             # Very first frame ever. Nothing to predict against, so no gate.
             self._t = t
@@ -352,6 +380,8 @@ class PixelTracker:
             a = _I4 - k @ _H
             self._P = a @ p_pred @ a.T + k @ _R @ k.T
             self._last_det = match
+            self._held_det = match
+            self._held_det_t = t
 
         # Every frame, hit or miss.
         self.q = config.Q_BASE + config.Q_DECAY * (self.q - config.Q_BASE)
@@ -390,6 +420,23 @@ class PixelTracker:
         if decayed >= config.COAST_DECAY_MS:
             return 0.0
         return 1.0 - decayed / config.COAST_DECAY_MS
+
+    @staticmethod
+    def _shape_ok(d: Detection) -> bool:
+        """Is this box drone-shaped enough to be used as a measurement?
+
+        ONE-SIDED ON PURPOSE. The hand signature is WIDE: 1.67-2.22 over the
+        17 associated boxes of the recorded hand approach. The drone held
+        edge-on or folded is TALL AND NARROW -- 0.39-0.48 on 17 frames across
+        both runs, and the frames show the real airframe every time. A
+        symmetric window would throw those away and lose the track, which is
+        the failure this is meant to reduce. Refusing to FIRE on an odd box is
+        free; refusing to TRACK one is not.
+        """
+        h = float(d.y2) - float(d.y1)
+        if h <= 0.0:
+            return False
+        return (float(d.x2) - float(d.x1)) / h <= config.ASSOC_BOX_ASPECT_MAX
 
     def _associate(self, dets: List[Detection], x_pred: np.ndarray,
                    p_pred: Optional[np.ndarray] = None
@@ -454,6 +501,16 @@ class PixelTracker:
             ok = d2 <= floor2
             if not ok and d2 <= ceil2 and s_inv is not None:
                 ok = float(nu @ s_inv @ nu) <= config.GATE_CHI2
+            # A LONE CONFIDENT DETECTION OUTRUNS THE PREDICTION, NOT THE GATE.
+            # With one box in frame there is nothing to mistake it for, so a
+            # large innovation says the PREDICTION is stale -- which is what a
+            # hand-carried drone does to a constant-velocity model. In
+            # run_2026-09-20_144709, 21 of 26 TRACK losses were the real drone
+            # at conf 0.54-0.81, a median 241 px away. Shape-filtered upstream
+            # and still capped by GATE_MAX_PX.
+            if (not ok and len(dets) == 1 and d2 <= config.ASSOC_LONE_PX ** 2
+                    and float(d.conf) >= config.ASSOC_LONE_CONF):
+                ok = True
             if ok and d2 < best_d2:
                 if best is not None:
                     rejected.append(math.sqrt(best_d2))
@@ -613,6 +670,9 @@ class PixelTracker:
         self._hold = None
         self._prev_box = None
         self._last_det = None
+        # A track that has been given up on has no measurement to offer.
+        self._held_det = None
+        self._held_det_t = None
         self._coast_t0 = None
         self._coast_v0 = None
 
@@ -664,6 +724,22 @@ class PixelTracker:
         else:
             x, _ = self._propagate(self._x, self._P, t - self._t, t)
 
+        # WHICH BOX THE INTERLOCK IS ALLOWED TO SEE.
+        #
+        # On a frame that associated, this is that detection. On a frame that
+        # did not, it is the last associated one for up to FIRE_BOX_HOLD_S --
+        # carrying its ORIGINAL measurement time, so nothing downstream is
+        # misled about how old it is.
+        #
+        # SEARCH never offers a held box: the track has been given up on, and
+        # a firing permission must not outlive the track it belonged to.
+        box, box_t = self._last_det, (None if self._last_det is None else self._t)
+        if (box is None and self.state is not TrackState.SEARCH
+                and self._held_det is not None and self._held_det_t is not None):
+            age = t - self._held_det_t
+            if 0.0 <= age <= config.FIRE_BOX_HOLD_S:
+                box, box_t = self._held_det, self._held_det_t
+
         bias = self._aim_bias()
         range_m, range_source = self._range()
         return TrackEstimate(
@@ -676,11 +752,12 @@ class PixelTracker:
             q=self.q,
             nis=self.nis,
             occluded=self._hold is not None,
-            box=self._last_det,
-            # `_last_det` is cleared to None on any frame that fails to
-            # associate, so when it is set it is always from the most recent
-            # update, at self._t. The interlock gates the beam on this age.
-            box_t=None if self._last_det is None else self._t,
+            box=box,
+            # The time the box was MEASURED, never the time it is being read.
+            # On a hit that is self._t; on a held box it is when the hold
+            # started, so the interlock's DRONE_BOX_MAX_AGE_S test keeps
+            # working on the real age and a held box expires on schedule.
+            box_t=box_t,
             range_m=range_m,
             range_source=range_source,
         )

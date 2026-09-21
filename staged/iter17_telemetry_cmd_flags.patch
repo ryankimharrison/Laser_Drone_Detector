@@ -1,0 +1,23 @@
+# Patch for turret_host/telemetry.py -- iteration 17 bundle, generated 2026-09-20.
+# Apply:  git apply staged/iter17_telemetry_cmd_flags.patch
+#
+--- turret_host/telemetry.py
++++ turret_host/telemetry.py (iter17)
+@@ -499,6 +499,17 @@
+                                      _f(getattr(out, "omega_at_box_b", None))],
+                     "p_scale": _f(getattr(out, "p_scale", None)),
+                     "authority": _f(getattr(out, "authority", None)),
++                    # WHAT THE BOARD DID WITH IT. Without these three the
++                    # "commanded vs delivered" comparison has an unobserved
++                    # middle, and a rate the firmware refused on its own
++                    # authority is indistinguishable from a motor that did
++                    # not deliver. See link.py's note on the vel ack.
++                    "limited": bool(getattr(link, "vel_limited", False))
++                    if link is not None else None,
++                    "tripped": bool(getattr(link, "vel_tripped", False))
++                    if link is not None else None,
++                    "impact": bool(getattr(link, "vel_impact", False))
++                    if link is not None else None,
+                 }
+             else:
+                 rec["cmd"] = None

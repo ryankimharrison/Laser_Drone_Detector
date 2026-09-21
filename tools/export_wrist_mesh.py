@@ -70,8 +70,12 @@ DROP_SUBSTRINGS = (
     "socket head screw",     # 93705A838, 90042A304
     "locknut",               # 93625A115, 90576A104
     "washer",                # 95211A150
-    "gy85",                  # IMU breakout -- a PCB
 )
+# The GY-85 is KEPT, unlike every other PCB. It is the part the pose overlay's
+# solid model actually reads, so the one board worth its triangles is the one
+# the display is about. It arrives as two solids -- a 1.5 mm substrate and its
+# component cluster -- which is why the blue silkscreen can be a real body here
+# rather than the synthetic surface patch the brief's viewer had to fake.
 # Whole subtrees to skip, by node name. The PCB is 75 parts and 80k triangles
 # of KiCad footprints: caps, resistors, JST shrouds, a Pico.
 DROP_SUBTREES = ("PCB:1", "Full PCB:1")
@@ -89,33 +93,68 @@ DROP_SUBTREES = ("PCB:1", "Full PCB:1")
 #   pulley_b  likewise
 #   carrier   the differential case -- this is what PITCH rotates
 #   head      output gear + payload -- pitch, then yaw on top
+#
+# The static group and the payload are split further than the kinematics needs,
+# purely so they can be COLOURED separately: one flat grey machine is unreadable
+# at 260 px, and the parts a viewer needs to find -- the orange optical face the
+# beam leaves through, the blue IMU the solid model is measured from -- are
+# exactly the ones that vanish into it. Bodies sharing a rotation cost nothing
+# extra to animate; the renderer maps several names onto one matrix.
 RULES = (
+    # ---- payload: pitch, then yaw on top ---------------------------
+    ("Payload (1):1/GY85",                  "head_imu"),   # split -> imu + silk
+    ("Payload (1):1/Back end and wiring",   "head_back"),
+    # The optical faceplate, by name. A geometric search for it -- largest
+    # beam-perpendicular plane ahead of the head centroid -- picked the
+    # PLATE'S BACK FACE, because the back is the larger of the two (3893 mm2
+    # against 3360) exactly as the brief warns: the front is interrupted by
+    # the laser bore and both camera apertures. The CAD already separates the
+    # part, so take it whole and skip the search.
+    ("Payload (1):1/sterolaserview:1/logi c270:1/Camera cover (1):1/Top shell",
+                                            "head_face"),
+    ("Payload (1):1/sterolaserview",        "head_rest"),
+    ("Output gear",                         "head_gear"),
+    ("Payload",                             "head_rest"),  # anything else on the payload
+    # ---- the differential case: pitch only -------------------------
+    ("Differential Case:1",                 "carrier"),
+    # ---- input bevels: pitch +/- yaw -------------------------------
     ("A frame:1/Input Gear A:1",            "input_a"),
     ("B frame:1/Input Gear A(Mirror):1",    "input_b"),
+    # ---- motor pulleys: N x the input rate -------------------------
     ("A frame:1/=>",                        "pulley_a"),
     ("B frame:1/=>",                        "pulley_b"),
     ("A frame:1/GT2 pully",                 "pulley_a"),
     ("B frame:1/GT2 pully",                 "pulley_b"),
     ("3764N109",                            "pulley_b"),   # loose instance, z < 0
-    ("A frame:1",                           "base"),
-    ("B frame:1",                           "base"),
-    ("And and b frame joiner:1",            "base"),
-    ("Differential Case:1",                 "carrier"),
-    ("Output gear",                         "head"),
-    ("Payload",                             "head"),
+    # ---- static. Specific before the frame catch-alls --------------
+    ("A frame:1/Nema 17",                   "motor"),
+    ("B frame:1/Nema 17",                   "motor"),
+    ("A frame:1/Endcap",                    "endcap"),
+    ("B frame:1/Endcap",                    "endcap"),
+    ("And and b frame joiner:1",            "base_plate"),
+    ("A frame:1",                           "frame"),
+    ("B frame:1",                           "frame"),
 )
 
 # Triangle budget per body, split across that body's parts in proportion to
 # their raw counts. The head and base carry the silhouette so they get the
 # most; the pulleys are 20 mm discs that nobody looks at.
 BUDGET = {
-    "base":     4400,
-    "carrier":  1000,
-    "head":     4400,
-    "input_a":  1100,
-    "input_b":  1100,
-    "pulley_a":  380,
-    "pulley_b":  380,
+    "base_plate": 1600,
+    "frame":      5000,   # the two side plates carry most of the silhouette
+    "motor":      2800,
+    "endcap":     1800,
+    "carrier":    1400,
+    "head_gear":  2600,
+    "head_back":  1400,
+    "head_imu":   2000,
+    "head_silk":   700,   # a flat 1.5 mm slab, but it shreds if starved
+    "head_face":  1400,   # the optical plate: flat, needs its outline only
+    "head_rest":  4200,
+    "input_a":    2200,
+    "input_b":    2200,
+    "pulley_a":    520,
+    "pulley_b":    520,
 }
 # No part drops below this, however small its share. A bracket reduced to 30
 # triangles stops being recognisable and starts being a shard.
@@ -127,16 +166,33 @@ MIN_PART_TRIS = 150
 # costing more than the shadow is worth.
 SHADOW_BUDGET = 340
 
-# Body colours, MuJoCo-ish: cool grey structure, warmer moving parts so the
-# differential reads at a glance.
+# Body colours: white structure, orange on every face that means something
+# optically (the end caps, the rear plate, the face the beam leaves through),
+# dark metal for the motors, and the GY-85 in board blue and IC black.
+#
+# Stored in LINEAR light, because the renderer finishes with a sqrt as a cheap
+# gamma -- so each entry is (hex / 255) ** 2 and `_srgb` does that conversion,
+# keeping the table readable as the hex values it was specified in.
+def _srgb(hex_rgb: int) -> tuple:
+    return tuple(((hex_rgb >> s & 0xFF) / 255.0) ** 2 for s in (16, 8, 0))
+
+
 COLORS = {
-    "base":     (0.42, 0.45, 0.52),
-    "carrier":  (0.83, 0.52, 0.26),
-    "head":     (0.62, 0.67, 0.76),
-    "input_a":  (0.30, 0.55, 0.68),
-    "input_b":  (0.30, 0.55, 0.68),
-    "pulley_a": (0.34, 0.37, 0.43),
-    "pulley_b": (0.34, 0.37, 0.43),
+    "base_plate": _srgb(0xEEF1F6),
+    "frame":      _srgb(0xEEF1F6),
+    "motor":      _srgb(0x6E757F),
+    "endcap":     _srgb(0xD98A3A),
+    "carrier":    _srgb(0x454B54),
+    "head_gear":  _srgb(0x8A93A3),
+    "head_back":  _srgb(0xD98A3A),
+    "head_silk":  _srgb(0x2F6FD0),
+    "head_imu":   _srgb(0x15181D),
+    "head_face":  _srgb(0xD98A3A),
+    "head_rest":  _srgb(0xEEF1F6),
+    "input_a":    _srgb(0x454B54),
+    "input_b":    _srgb(0x454B54),
+    "pulley_a":   _srgb(0x454B54),
+    "pulley_b":   _srgb(0x454B54),
 }
 
 
@@ -243,7 +299,15 @@ def _cluster(v, f, cell):
     nv /= counts[:, None]
     nf = inv[f]
     ok = (nf[:, 0] != nf[:, 1]) & (nf[:, 1] != nf[:, 2]) & (nf[:, 0] != nf[:, 2])
-    return nv, nf[ok]
+    nf = nf[ok]
+    # DEDUPE. Snapping to a grid folds distinct triangles onto the same vertex
+    # triple, and a repeated triangle makes every one of its edges look
+    # non-manifold: the 60T input pulley came out of here with 312 such edges
+    # from a source that had none. Measured with tools/../edges audit.
+    if len(nf):
+        _, keep = np.unique(np.sort(nf, axis=1), axis=0, return_index=True)
+        nf = nf[np.sort(keep)]
+    return nv, nf
 
 
 def _decimate(v, f, target):
@@ -301,6 +365,55 @@ def _repair(v, f):
         return v.astype(np.float32), f.astype(np.int32)
 
 
+def _boresight(parts, origin):
+    """Direction the laser and both cameras look along, or None.
+
+    The optics plate is flat, so its least-spread direction is the plate
+    normal. The normal has no inherent sign; resolve it against the wiring
+    bracket, which is bolted to the BACK of the plate, so forward is the way
+    that points away from it. (AGENT_HANDOFF calls the boresight +x; in this
+    assembly's frame the optics look down -x, with the bracket occupying
+    x = +6..+52 behind them.)
+    """
+    plate = [v - origin for p, v, _ in parts if "sterolaserview" in p]
+    if not plate:
+        return None
+    pv = np.vstack(plate)
+    c = pv.mean(0)
+    _w, V = np.linalg.eigh(np.cov((pv - c).T))
+    bore = V[:, 0]
+    back = [v - origin for p, v, _ in parts if "Back end and wiring" in p]
+    if back and float((np.vstack(back).mean(0) - c) @ bore) > 0:
+        bore = -bore
+    return bore
+
+
+def _muzzle(parts, origin, bore):
+    """Where the beam leaves: the front face of the optics plate.
+
+    Centroid of the vertices furthest along the boresight, so the beam starts
+    at the glass rather than at the wrist centre.
+    """
+    pv = np.vstack([v - origin for p, v, _ in parts if "sterolaserview" in p])
+    d = pv @ bore
+    return pv[d >= np.quantile(d, 0.98)].mean(0)
+
+
+def _split_silk(group):
+    """GY-85 parts -> (components, substrate).
+
+    The board normal is the assembly +Y (CAD, to 0.3 deg), so the bare
+    substrate is simply the part with the smallest Y extent -- 1.5 mm against
+    the 11.5 mm the component cluster stands off the board. Picked by geometry
+    rather than by node name because the exporter's names carry a content hash
+    that changes on every re-tessellation.
+    """
+    if len(group) < 2:
+        return group, []
+    thin = min(group, key=lambda vf: float(vf[0][:, 1].max() - vf[0][:, 1].min()))
+    return [p for p in group if p is not thin], [thin]
+
+
 def main(argv):
     step = Path(argv[1]) if len(argv) > 1 else DEFAULT_STEP
     if not step.exists():
@@ -338,6 +451,10 @@ def main(argv):
     print(f"  yaw   axis {np.round(yaw_ax, 4)} through ({yaw_c[0]:.2f}, *, {yaw_c[2]:.2f})")
     print(f"  origin {np.round(origin, 2)}  (axes cross here)")
 
+    # ---- boresight, BEFORE grouping ----------------------------------
+    # The faceplate split needs it, and that runs inside the body loop below.
+    bore = _boresight(parts, origin)
+
     # ---- group, merge, decimate --------------------------------------
     groups: dict[str, list] = {}
     unassigned = []
@@ -350,8 +467,16 @@ def main(argv):
     for path, n in unassigned:
         print(f"    ? unassigned, dropped: {path} ({n} tris)")
 
+    # The GY-85 arrives as two solids; separate the bare board from the parts
+    # standing on it so one can be silkscreen blue and the other IC black.
+    if "head_imu" in groups:
+        groups["head_imu"], silk = _split_silk(groups["head_imu"])
+        if silk:
+            groups["head_silk"] = silk
+
     out: dict[str, np.ndarray] = {}
     names = []
+    finished: dict[str, tuple] = {}
     total_in = total_out = 0
     for body in BUDGET:
         if body not in groups:
@@ -373,6 +498,11 @@ def main(argv):
         v = np.vstack(vs).astype(np.float32)
         f = np.vstack(fs).astype(np.int32)
         total_out += len(f)
+        finished[body] = (v, f)
+        print(f"  {body:10s} {len(groups[body]):2d} parts -> {len(v):5d} verts, "
+              f"{len(f):5d} tris")
+
+    for body, (v, f) in finished.items():
         sv, sf = _decimate(v, f, SHADOW_BUDGET)
         out[f"{body}_v"] = v
         out[f"{body}_f"] = f
@@ -380,33 +510,11 @@ def main(argv):
         out[f"{body}_sv"] = sv
         out[f"{body}_sf"] = sf
         names.append(body)
-        print(f"  {body:9s} {len(groups[body]):2d} parts -> {len(v):5d} verts, "
-              f"{len(f):5d} tris (+{len(sf)} shadow)")
 
-    # ---- payload boresight + laser aperture --------------------------
-    # The optics plate is flat: its least-spread direction is the plate normal,
-    # which is the direction the laser and both cameras look along.
-    plate = [v - origin for p, v, _ in parts if "sterolaserview" in p]
-    if plate:
-        pv = np.vstack(plate)
-        c = pv.mean(0)
-        w, V = np.linalg.eigh(np.cov((pv - c).T))
-        bore = V[:, 0]
-        # The normal has no inherent sign. Resolve it against the wiring
-        # bracket, which is bolted to the BACK of the plate: forward is the way
-        # that points away from it. (AGENT_HANDOFF calls the boresight +x; in
-        # this assembly's frame the optics look down -x, with the bracket
-        # occupying x = +6..+52 behind them.)
-        back = [v - origin for p, v, _ in parts if "Back end and wiring" in p]
-        if back and float((np.vstack(back).mean(0) - c) @ bore) > 0:
-            bore = -bore
-        # Aperture: centroid of the vertices furthest along the boresight, i.e.
-        # the front face of the plate, so the beam starts at the glass.
-        d = pv @ bore
-        front = pv[d >= np.quantile(d, 0.98)]
+    if bore is not None:
         out["boresight"] = bore.astype(np.float32)
-        out["muzzle"] = front.mean(0).astype(np.float32)
-        print(f"  boresight {np.round(bore, 4)}  muzzle {np.round(front.mean(0), 1)}")
+        out["muzzle"] = _muzzle(parts, origin, bore).astype(np.float32)
+        print(f"  boresight {np.round(bore, 4)}  muzzle {np.round(out['muzzle'], 1)}")
 
     allv = np.vstack([out[f"{b}_v"] for b in names])
     out["bodies"] = np.asarray(names)

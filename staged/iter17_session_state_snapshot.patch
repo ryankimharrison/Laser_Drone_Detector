@@ -1,0 +1,81 @@
+# Patch for turret_host/telemetry.py -- iteration 17 bundle, generated 2026-09-20.
+# Apply:  git apply staged/iter17_session_state_snapshot.patch
+#
+--- turret_host/telemetry.py
++++ turret_host/telemetry.py (iter17)
+@@ -127,6 +127,9 @@
+         self.labels_skipped = 0
+         self.wide_frames_saved = 0
+         self.wide_frames_dropped = 0
++        #: Board STATE at run start and end, keyed by label. See
++        #: snapshot_state(); empty when nothing could be read.
++        self._state_snaps = {}
+         #: Camera threads, for the duplicate counters in session.json. Set by
+         #: the app once the threads exist; empty is fine.
+         self.cameras: dict = {}
+@@ -148,6 +151,54 @@
+             self.wide_dir.mkdir(parents=True, exist_ok=True)
+ 
+     # -- lifecycle ---------------------------------------------------------
++    def snapshot_state(self, label: str) -> None:
++        """Record the BOARD's own view of the world under `label`.
++
++        Two of these bracket a run. Between them sits every number the AAR
++        argues about, and until now none of them could be checked against
++        what the firmware thought: the recorder logged what the host asked
++        for and what the IMU saw, and nothing about the board's own pose,
++        clamp or guard. On run_2026-09-20_184448 the step-count clamp
++        refused pitch for 7 s on a count 70 deg wrong, and no field in the
++        recording could show it.
++
++        MUST BE CALLED ON AN IDLE BOARD. link.state() is SETUP ONLY --
++        _require_idle refuses it while the servo path is active, by design,
++        because there is no version of it that is safe while servoing. A
++        refusal is stored as the reason rather than raised: a snapshot is a
++        diagnostic, and one that can abort a shutdown is worse than none.
++        """
++        if self.link is None:
++            self._state_snaps[label] = {"error": "no link (sim run)"}
++            return
++        try:
++            st = self.link.state()
++            self._state_snaps[label] = {
++                "t": time.perf_counter() - self.t0,
++                "payload": st.get("payload"),
++                "velocity": st.get("velocity"),
++                "guard": st.get("guard"),
++                "datum": st.get("datum"),
++                "axes": {n: {"position": a.get("position"),
++                             "microstep": a.get("microstep"),
++                             "mode": a.get("mode")}
++                         for n, a in (st.get("axes") or {}).items()},
++            }
++        except Exception as exc:                           # noqa: BLE001
++            self._state_snaps[label] = {"error": "%s: %s"
++                                        % (type(exc).__name__, exc)}
++
++    def rewrite_session(self) -> None:
++        """Re-emit session.json. For a snapshot taken after close().
++
++        The end snapshot cannot happen at close() -- see snapshot_state --
++        so the file is written once there and refreshed here.
++        """
++        try:
++            self._write_session()
++        except Exception:                                  # noqa: BLE001
++            pass
++
+     def start(self) -> "FlightRecorder":
+         if self.link is not None and self.imu_period:
+             self._thread = threading.Thread(target=self._imu_loop,
+@@ -653,5 +704,10 @@
+             "duplicates_dropped": dict(self._dup_counts()),
+             "imu_probe_delivered": probe[0],
+             "imu_probe_dropped": probe[1],
++            # THE BOARD'S OWN VIEW, at both ends of the run: its dead-reckoned
++            # pose, its step counts and microstep, and whether its clamp or
++            # crash guard had fired. "start" is taken before tracking, "end"
++            # after the motors are parked -- see snapshot_state.
++            "board_state": dict(self._state_snaps),
+             "failed": self.failed,
+         }, indent=2), encoding="utf-8")
