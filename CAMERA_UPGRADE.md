@@ -55,3 +55,54 @@ the handheld 1.6 aspect-ratio association veto; invalid boxes are still rejected
 and laser containment rules are unchanged. Range estimates now allow 1.5–12 m,
 covering the previous 5–10 m work, but remain approximate silhouette-size
 estimates using the configured focal length. They are not ground-truth depth.
+
+## Dataset and training workflow
+
+Keep each capture session wholly in one partition, including both cameras.
+Choose independent sessions for train, validation and test; do not split two
+parts of the same flight into differently named sessions. Use a new output
+version instead of modifying the previous reviewed dataset:
+
+```powershell
+python -m turret_host.ingest_session training_flight --split train --output dataset/flight_v1 --no-prelabel
+python -m turret_host.ingest_session validation_flight --split val --output dataset/flight_v1 --no-prelabel
+python -m turret_host.ingest_session test_flight --split test --output dataset/flight_v1 --no-prelabel
+```
+
+Replace these session names with actual directories under `dataset/` containing
+`clips/<clip>/narrow_*.jpg` and `wide_*.jpg`. Existing original images/labels are
+not migrated or changed by these commands. Reuse older reviewed examples by
+copying their image/label pairs into their assigned session partition in the
+new version, preserving `session__clip__camera_frame` filenames. A former
+temporally split session must be assigned wholly to one partition.
+
+Label and review every partition, including missed detections. Empty labels
+mean negatives, not unreviewed positives; the audit cannot establish human
+review. Ingestion does not automatically prelabel test footage, and reruns
+prelabel only newly added train/val images. The old automatic temporal-split
+fallback now refuses and directs users to session ingestion.
+
+After review:
+
+```powershell
+python -m turret_host.train_detector --data dataset/flight_v1/data.yaml --freeze-test
+python -m turret_host.train_detector --data dataset/flight_v1/data.yaml --weights models/drone_y11n_v4_1280.pt --check
+python -m turret_host.train_detector --data dataset/flight_v1/data.yaml --weights models/drone_y11n_v4_1280.pt --name flight_v1_candidate --seed 0
+python -m turret_host.train_detector --data dataset/flight_v1/data.yaml --weights models/drone_y11n_v4_1280.pt --evaluate --split test --name flight_v1_baseline_test
+```
+
+Training audits session leakage, exact duplicate image content across partitions,
+label presence/format, and test image/label hashes before loading a model. A
+frozen test set cannot be extended or re-frozen after edits. Validation is used
+for iterative selection; reserve test evaluation for final comparisons. Exact
+hash checks cannot detect re-encoded near-duplicates; independent sessions are
+still required. The YAML supports directory partitions ending in `images` with
+sibling `labels` directories and one class, `drone`.
+
+The training default input is 1280; tune `--batch` to measured VRAM capacity.
+`--weights`, `--data`, `--device`, `--seed`, `--degrees`, `--scale`, and HSV
+augmentation flags are explicit experiment controls. Retain color imagery and
+augmentation appropriate for the unchanged wide camera. Every training or
+evaluation run writes `experiment.json` containing arguments, dataset/checkpoint
+hashes and library versions, and refuses an existing run name. No data has been
+collected, labels changed, weights trained or models promoted by this code update.

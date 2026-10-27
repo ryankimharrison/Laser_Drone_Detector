@@ -628,6 +628,10 @@ def build_split(session: Optional[str] = None, val_fraction: float = 0.25,
     first when forced. To ADD a session to an existing tree, use
     `turret_host.ingest_session`, which leaves everything already there alone.
     """
+    if val_mode == "auto" or _os.path.exists(_os.path.join(DATASET_DIR, "yolo", "split_manifest.json")):
+        print("Use ingest_session <session> --split train|val|test to keep whole sessions together.")
+        print("Automatic temporal fallback and rebuilding a session-assigned dataset are disabled.")
+        return 1
     existing = [p for split in ("train", "val")
                 for p in _glob.glob(_os.path.join(DATASET_DIR, "yolo", split,
                                                   "labels", "*.txt"))
@@ -904,8 +908,8 @@ def main() -> int:
                     help="rebuild even though labels exist (backs them up first)")
     ap.add_argument("--val-fraction", type=float, default=0.25)
     ap.add_argument("--val-mode", default="auto", choices=["auto", "clip", "temporal"],
-                    help="how to hold out validation. 'clip' is strict but needs "
-                         "more than one clip per shot; 'auto' falls back to 'temporal'")
+                    help="legacy rebuild only: auto refuses and directs to whole-session ingestion; "
+                         "clip/temporal are explicit historical workflows")
     ap.add_argument("--negatives-only", action="store_true",
                     help="capture ONLY the no-drone shots. See "
                          "negatives_only_shot_list() for why this deserves a "

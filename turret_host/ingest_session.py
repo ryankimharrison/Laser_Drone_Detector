@@ -21,12 +21,10 @@ only what it just added.
 
 SPLIT RULE
 ----------
-Matches what is already in the tree: the last 25% of each clip goes to val.
-That is a TEMPORAL split, not a clip-wise one, and it is optimistic -- train and
-val share clips, so neighbouring frames either side of the cut are near
-duplicates. `capture_dataset` falls back to it because there is one clip per
-shot and splitting by clip would drop whole conditions out of training. Keeping
-the same rule at least keeps the two sessions comparable. Judge the model live.
+Assign each whole session with --split train|val|test. Both cameras and all clips
+stay together. Assignments are immutable. --output selects a versioned dataset.
+Existing labels are preserved; only newly ingested train/val frames are
+automatically prelabelled. Frozen test data cannot be extended in place.
 """
 from __future__ import annotations
 
@@ -39,7 +37,9 @@ if _sys.path and _os.path.abspath(_sys.path[0]) == _pkg_dir:
 import argparse
 import datetime
 import glob
+import json
 import shutil
+from pathlib import Path
 from typing import Dict, List
 
 import cv2
@@ -64,7 +64,7 @@ def _sessions() -> List[str]:
 
 def _existing_stems() -> set:
     have = set()
-    for split in ("train", "val"):
+    for split in ("train", "val", "test"):
         d = _os.path.join(YOLO_DIR, split, "images")
         if _os.path.isdir(d):
             have.update(n[:-4] for n in _os.listdir(d) if n.endswith(".jpg"))
@@ -72,7 +72,7 @@ def _existing_stems() -> set:
 
 
 def _backup() -> None:
-    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")
     st = _os.path.join(DATASET_DIR, "review_state.json")
     if _os.path.exists(st):
         dst = _os.path.join(DATASET_DIR, "review_state_%s.json" % stamp)
@@ -87,15 +87,34 @@ def _backup() -> None:
     print("backed up labels -> labels_backup_%s/" % stamp)
 
 
-def ingest(session: str, dry_run: bool = False) -> int:
+def ingest(session: str, dry_run: bool = False, split: str = None) -> int:
+    """Assign an entire session (both cameras) to one immutable partition."""
+    if Path(session).name != session or session in ('.', '..') or '__' in session:
+        raise ValueError('session must be a directory name without __')
     sess_dir = _os.path.join(DATASET_DIR, session)
     clips_dir = _os.path.join(sess_dir, "clips")
     if not _os.path.isdir(clips_dir):
         print("no such session: %s" % session)
         return 1
 
+    manifest_path = Path(YOLO_DIR) / 'split_manifest.json'
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    known = manifest.get(session)
+    present = {part for part in ('train', 'val', 'test')
+               if any((Path(YOLO_DIR) / part / 'images').glob(session + '__*.jpg'))}
+    if len(present) > 1 or (known and present - {known}):
+        raise ValueError('session already crosses splits; rebuild a versioned dataset preserving labels')
+    assigned = known or next(iter(present), None)
+    if split is None:
+        split = assigned
+    if split not in ('train', 'val', 'test'):
+        raise ValueError('new sessions require --split train, val, or test')
+    if assigned and split != assigned:
+        raise ValueError('session split is immutable: %s is already %s' % (session, assigned))
+    if split == 'test' and (Path(YOLO_DIR) / 'test_lock.json').exists():
+        raise ValueError('test set is frozen; create a new dataset version to add test footage')
     have = _existing_stems()
-    added: Dict[str, List[str]] = {"train": [], "val": []}
+    added: Dict[str, List[str]] = {part: [] for part in ('train', 'val', 'test')}
     skipped = 0
 
     for clip_id in sorted(_os.listdir(clips_dir)):
@@ -106,38 +125,44 @@ def ingest(session: str, dry_run: bool = False) -> int:
             files = sorted(glob.glob(_os.path.join(clip_dir, "%s_*.jpg" % cam)))
             if not files:
                 continue
-            # Last VAL_FRACTION of THIS camera's frames in THIS clip -> val,
-            # which is the rule already applied to the tree.
-            cut = int(round(len(files) * (1.0 - VAL_FRACTION)))
             for i, src in enumerate(files):
                 stem = "%s__%s__%s" % (session, clip_id,
                                        _os.path.basename(src)[:-4])
                 if stem in have:
                     skipped += 1
                     continue
-                added["val" if i >= cut else "train"].append(src)
+                added[split].append(src)
 
-    total = len(added["train"]) + len(added["val"])
+    total = sum(map(len, added.values()))
     print("session %s" % session)
-    print("   new frames: %d  (train %d, val %d)   already present: %d"
-          % (total, len(added["train"]), len(added["val"]), skipped))
+    print("   new frames: %d -> %s; already present: %d" % (total, split, skipped))
     if dry_run or total == 0:
         return 0
 
     _backup()
-    for split in ("train", "val"):
+    for split in ("train", "val", "test"):
         for sub in ("images", "labels"):
             _os.makedirs(_os.path.join(YOLO_DIR, split, sub), exist_ok=True)
         for src in added[split]:
             clip_id = _os.path.basename(_os.path.dirname(src))
             stem = "%s__%s__%s" % (session, clip_id, _os.path.basename(src)[:-4])
             shutil.copy2(src, _os.path.join(YOLO_DIR, split, "images", stem + ".jpg"))
-            open(_os.path.join(YOLO_DIR, split, "labels", stem + ".txt"), "w").close()
+            label = Path(YOLO_DIR) / split / 'labels' / (stem + '.txt')
+            if not label.exists():
+                label.touch()  # preserve an existing reviewed/orphaned label
+    manifest[session] = assigned or next(part for part, files in added.items() if files)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    yaml_path = Path(YOLO_DIR) / 'data.yaml'
+    if not yaml_path.exists():
+        yaml_path.write_text('path: ' + json.dumps(str(Path(YOLO_DIR).resolve())) +
+                             '\ntrain: train/images\nval: val/images\ntest: test/images\n'
+                             'names:\n  0: drone\n')
     print("copied %d frames into dataset/yolo" % total)
     return 0
 
 
-def prelabel_session(session: str, prompt: str = prelabel.GDINO_PROMPT) -> int:
+def prelabel_session(session: str, prompt: str = prelabel.GDINO_PROMPT,
+                     only_stems=None) -> int:
     """Grounding DINO over ONLY this session's positive frames, both cameras.
 
     Same gate and same choice as `prelabel.py`: drop boxes that cannot be a
@@ -171,6 +196,8 @@ def prelabel_session(session: str, prompt: str = prelabel.GDINO_PROMPT) -> int:
             stem = name[:-4]
             clip = prelabel._clip_of(stem)
             lbl_path = _os.path.join(lbl_dir, stem + ".txt")
+            if only_stems is not None and stem not in only_stems:
+                continue
             if clip not in has_drone:
                 stats["unknown"] += 1
                 continue
@@ -214,9 +241,13 @@ def main() -> int:
     ap.add_argument("session", nargs="?")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--split", choices=('train', 'val', 'test'),
+                    help='assign the whole session; required for a new session')
+    ap.add_argument("--output", default=YOLO_DIR, help='versioned YOLO dataset directory')
     ap.add_argument("--no-prelabel", action="store_true")
     ap.add_argument("--prompt", default=prelabel.GDINO_PROMPT)
     args = ap.parse_args()
+    globals()['YOLO_DIR'] = str(Path(args.output).resolve())
 
     if args.list or not args.session:
         have = _existing_stems()
@@ -227,11 +258,18 @@ def main() -> int:
             print("   %-22s %4d frames on disk, %4d already in dataset/yolo" % (s, n, inn))
         return 0
 
-    rc = ingest(args.session, args.dry_run)
-    if rc or args.dry_run or args.no_prelabel:
+    before = _existing_stems()
+    try:
+        rc = ingest(args.session, args.dry_run, args.split)
+    except ValueError as exc:
+        ap.error(str(exc))
+    new_stems = _existing_stems() - before
+    manifest_path = Path(YOLO_DIR) / 'split_manifest.json'
+    assigned = json.loads(manifest_path.read_text()).get(args.session) if manifest_path.exists() else args.split
+    if rc or args.dry_run or args.no_prelabel or assigned == 'test' or not new_stems:
         return rc
     print()
-    return prelabel_session(args.session, args.prompt)
+    return prelabel_session(args.session, args.prompt, only_stems=new_stems)
 
 
 if __name__ == "__main__":
