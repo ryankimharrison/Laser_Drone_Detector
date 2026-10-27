@@ -45,3 +45,13 @@ files aside and measure again. Structured-light correspondence captures also
 carry context so the registration fitter cannot stamp old captures as new.
 The GUI disables an incompatible overlay; motion calibration loaders refuse it.
 Lens or mount changes require updating their IDs even when image size is unchanged.
+
+Flight tracking uses elapsed-time confirmation, loss, reseed and wide-fallback
+thresholds referenced to the former 30 fps behavior. At least two hits and
+0.133 s of uninterrupted evidence are required to confirm; loss from TRACK
+takes 0.333 s, independent of delivery rate. These are starting values to
+validate in flight, not performance claims. The replacement profile disables
+the handheld 1.6 aspect-ratio association veto; invalid boxes are still rejected
+and laser containment rules are unchanged. Range estimates now allow 1.5–12 m,
+covering the previous 5–10 m work, but remain approximate silhouette-size
+estimates using the configured focal length. They are not ground-truth depth.

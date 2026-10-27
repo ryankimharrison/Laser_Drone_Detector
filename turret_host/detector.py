@@ -495,7 +495,7 @@ class Detector:
             for (x1, y1, x2, y2), c, k in zip(xyxy, confs, clsids):
                 targets.append(Detection(
                     x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
-                    conf=float(c), label=str(result.names[int(k)]),
+                    conf=float(c), label=str(result.names[int(k)]), source=frame.camera,
                 ))
             # Strongest proposal first. The gate still decides, but when it has
             # no prior (SEARCH) it takes the top of this list.

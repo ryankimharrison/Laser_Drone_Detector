@@ -192,6 +192,9 @@ class PixelTracker:
         self._hits = 0
         self._misses = 0
 
+        self._hit_since: Optional[float] = None
+        self._last_hit_t: Optional[float] = None
+
         self._coast_t0: Optional[float] = None
         self._coast_v0: Optional[np.ndarray] = None
 
@@ -293,7 +296,7 @@ class PixelTracker:
         x_pred, p_pred = self._propagate(self._x, self._P, dt, t)
         match, self.last_rejected_px = self._associate(dets, x_pred, p_pred)
 
-        if match is None and dets and self._misses >= config.RESEED_AFTER_MISSES:
+        if match is None and dets and self.miss_duration(t) >= config.RESEED_AFTER_S:
             # RE-SEED. The gate above handles a filter that is UNSURE; this
             # handles one that is WRONG. After a run of misses the prediction
             # can be somewhere the target never went -- a jink during the
@@ -384,7 +387,7 @@ class PixelTracker:
             self._held_det_t = t
 
         # Every frame, hit or miss.
-        self.q = config.Q_BASE + config.Q_DECAY * (self.q - config.Q_BASE)
+        self.q = config.Q_BASE + config.Q_DECAY ** (dt * 30.) * (self.q - config.Q_BASE)
 
         self._t = t
         self._step_state(match is not None, t)
@@ -434,9 +437,11 @@ class PixelTracker:
         free; refusing to TRACK one is not.
         """
         h = float(d.y2) - float(d.y1)
-        if h <= 0.0:
+        w = float(d.x2) - float(d.x1)
+        if not all(math.isfinite(v) for v in (d.x1, d.x2, d.y1, d.y2)) or min(w, h) <= 0.0:
             return False
-        return (float(d.x2) - float(d.x1)) / h <= config.ASSOC_BOX_ASPECT_MAX
+        limit = config.ASSOC_BOX_ASPECT_MAX
+        return limit is None or w / h <= limit
 
     def _associate(self, dets: List[Detection], x_pred: np.ndarray,
                    p_pred: Optional[np.ndarray] = None
@@ -547,10 +552,12 @@ class PixelTracker:
         extra lag-1 correlation into the innovations (measured: r1 -0.29 -> -0.36
         on a constant-velocity run) -- known, small, and not worth the coupling.
         """
-        su = config.ROLLING_SHUTTER_K_S * float(vel[0])
-        sv = config.ROLLING_SHUTTER_K_S * float(vel[1])
+        k = (config.CAMERA_PROFILES["wide"].rolling_shutter_s
+             if det.source.startswith("wide") else config.ROLLING_SHUTTER_K_S)
+        su = k * float(vel[0])
+        sv = k * float(vel[1])
         return Detection(det.x1 - su, det.y1 - sv, det.x2 - su, det.y2 - sv,
-                         det.conf, det.label)
+                         det.conf, det.label, source=det.source)
 
     # ------------------------------------------------------- occlusion hold
 
@@ -643,6 +650,8 @@ class PixelTracker:
         self.state = TrackState.ACQUIRE
         self._hits = 1
         self._misses = 0
+        self._hit_since = t
+        self._last_hit_t = t
         self.q = config.Q_BASE
         self.nis = 0.0
         self.last_nu_white = None
@@ -657,6 +666,8 @@ class PixelTracker:
         self.state = TrackState.SEARCH
         self._hits = 0
         self._misses = 0
+        self._hit_since = None
+        self._last_hit_t = None
         # Keep the last position so the GUI's marker does not snap to the corner,
         # but zero the velocity: nothing is being tracked, so nothing is moving
         # as far as this filter is concerned. Control must gate on state and
@@ -676,12 +687,20 @@ class PixelTracker:
         self._coast_t0 = None
         self._coast_v0 = None
 
+    def miss_duration(self, t: float) -> float:
+        """Elapsed time since associated evidence, independent of detector FPS."""
+        return max(0., t - self._last_hit_t) if self._last_hit_t is not None else 0.
+
     def _step_state(self, hit: bool, t: float) -> None:
         if hit:
             self._misses = 0
+            if self._hit_since is None:
+                self._hit_since = t
+            self._last_hit_t = t
             self._hits += 1
             if self.state is TrackState.ACQUIRE:
-                if self._hits >= config.ACQUIRE_FRAMES:
+                if (self._hits >= config.ACQUIRE_MIN_HITS
+                        and t - self._hit_since + 1e-9 >= config.ACQUIRE_CONFIRM_S):
                     self.state = TrackState.TRACK
             elif self.state is TrackState.COAST:
                 # Re-detected while coasting. Go back through ACQUIRE rather
@@ -689,17 +708,19 @@ class PixelTracker:
                 # should cost the same confirmation every time it is granted.
                 self.state = TrackState.ACQUIRE
                 self._hits = 1
+                self._hit_since = t
                 self._coast_t0 = None
                 self._coast_v0 = None
             return
 
         self._hits = 0
         self._misses += 1
+        self._hit_since = None
         if self.state is TrackState.ACQUIRE:
-            if self._misses >= config.ACQUIRE_MISSES:
+            if self.miss_duration(t) + 1e-9 >= config.ACQUIRE_LOSS_S:
                 self._to_search()
         elif self.state is TrackState.TRACK:
-            if self._misses >= config.TRACK_MISSES:
+            if self.miss_duration(t) + 1e-9 >= config.TRACK_LOSS_S:
                 self.state = TrackState.COAST
                 self._coast_t0 = t
                 self._coast_v0 = self._x[2:4].copy()

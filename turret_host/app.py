@@ -1808,7 +1808,7 @@ class TurretApp:
             targets = item.result.targets
             # See config.WIDE_FALLBACK_AFTER_MISSES: a live track coasts through
             # a short narrow dropout instead of taking a wide box.
-            _need = int(getattr(config, "WIDE_FALLBACK_AFTER_MISSES", 0) or 0)
+            _need = config.WIDE_FALLBACK_AFTER_S
             # 2026-09-20 run_183021: this gate BLOCKED THE COARSE PHASE. With the
             # tracker in ACQUIRE on a wide box, wide was allowed again only
             # after WIDE_FALLBACK_AFTER_MISSES (3) misses, which is exactly
@@ -1819,7 +1819,7 @@ class TurretApp:
             # approach is live (_coarse_t0 set) the wide box IS the track.
             _wide_ok = (self.tracker.state is TrackState.SEARCH
                         or self._coarse_t0 is not None
-                        or getattr(self.tracker, "_misses", 0) >= _need)
+                        or self.tracker.miss_duration(item.result.frame_t) >= _need)
 
             if targets:
                 # FINE PHASE. Narrow sees it, so the wide box is DROPPED

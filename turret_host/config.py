@@ -229,7 +229,7 @@ STEREO_BASELINE_MM = 60.0
 POSE_DR_DISAGREE_MAX_DEG = 20.0
 
 ASSUMED_RANGE_M = 3.0
-RANGE_LIMITS_M = (1.5, 6.0)
+RANGE_LIMITS_M = (1.5, 12.0)             # covers the measured 5–10 m indoor use envelope
 
 # Real width of the drone as seen by the detector, for apparent-size ranging:
 #   R = f * W_real / w_px
@@ -738,7 +738,7 @@ RESEED_MIN_CONF = 0.50
 
 # Rolling shutter: the C270 reads out over ~20 ms, so a moving target's
 # centroid is displaced along its motion. Subtract k * velocity per frame.
-ROLLING_SHUTTER_K_S = 0.010             # ESTIMATE; calibrate by panning past a static object
+ROLLING_SHUTTER_K_S = _narrow.rolling_shutter_s
 
 # Occlusion: the hand covers part of the drone and biases the box.
 AREA_DROP_FRAC = 0.30                   # >30% area loss in one frame = occlusion
@@ -768,6 +768,12 @@ AIM_BIAS_UP_FRAC = 0.0
 ACQUIRE_FRAMES = 5                      # consecutive hits to enter TRACK
 ACQUIRE_MISSES = 3                      # misses to fall back to SEARCH
 TRACK_MISSES = 10                       # misses to enter COAST
+ACQUIRE_CONFIRM_S = 4.0 / 30.0          # legacy 5 observations spanning 4 intervals
+ACQUIRE_MIN_HITS = 2                    # a single observation cannot confirm a track
+ACQUIRE_LOSS_S = 3.0 / 30.0
+TRACK_LOSS_S = 10.0 / 30.0
+RESEED_AFTER_S = 6.0 / 30.0
+WIDE_FALLBACK_AFTER_S = 3.0 / 30.0
 COAST_HOLD_MS = 150                     # hold last velocity
 COAST_DECAY_MS = 300                    # then decay to zero
 
@@ -951,7 +957,7 @@ FIRE_BOX_HOLD_S = 0.100
 #: Cost, measured across both runs: of the 55 accepted boxes outside the firing
 #: window, this rule rejects the 27 wide ones (25 of them the hand cluster) and
 #: keeps all 28 narrow ones.
-ASSOC_BOX_ASPECT_MAX = 1.6
+ASSOC_BOX_ASPECT_MAX = 1.6 if _narrow.name == "c270" else None
 
 #: A lone confident detection this far from the prediction is accepted even
 #: though the covariance gate refused it.
