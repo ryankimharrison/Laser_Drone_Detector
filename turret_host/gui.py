@@ -340,7 +340,13 @@ class TurretGUI:
         # truthful of the two. A machine that has never run the fit still
         # brings the panel up -- `_reg` is None and the pane falls back to
         # plain WIDE, which is exactly the old behaviour.
-        self._reg = WideNarrowRegistration.load()
+        from turret_host.calibration_context import CalibrationMismatchError, validate
+        import warnings
+        try:
+            self._reg = WideNarrowRegistration.load()
+        except CalibrationMismatchError as exc:
+            warnings.warn(str(exc), RuntimeWarning)
+            self._reg = None
         self._warper = Warper(self._reg) if self._reg is not None else None
         # The operator view is always fused when its registration exists.
         # A missing calibration still falls back to WIDE so the panel remains
@@ -358,10 +364,11 @@ class TurretGUI:
                               "calibration", "wide_narrow_homography.json")
             with open(_p, "r", encoding="utf-8") as _fh:
                 _b = json.load(_fh)
+            validate(_b, ("narrow", "wide"), _p)
             _lw, _ln = _b.get("laser_wide_px"), _b.get("laser_narrow_px")
             self._laser_wide = tuple(_lw) if _lw else None
             self._laser_narrow = tuple(_ln) if _ln else None
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, CalibrationMismatchError):
             pass
         self._closing = False
         self._after_id: Optional[str] = None

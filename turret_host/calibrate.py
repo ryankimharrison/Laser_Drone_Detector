@@ -123,7 +123,9 @@ def save_calibration(name: str, data: dict) -> Path:
     direction -- a truncated file must never look like a valid calibration.
     """
     CALIB_DIR.mkdir(parents=True, exist_ok=True)
-    payload = dict(data)
+    from turret_host.calibration_context import roles_for, stamp
+    roles = roles_for(name)
+    payload = stamp(data, roles) if roles else dict(data)
     payload["name"] = name
     payload["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     path = _calib_path(name)
@@ -146,7 +148,12 @@ def load_calibration(name: str, required: bool = False) -> Optional[dict]:
                 "no %s calibration at %s -- run `python -m turret_host.calibrate`"
                 % (name, path))
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    from turret_host.calibration_context import roles_for, validate
+    roles = roles_for(name)
+    if roles:
+        validate(payload, roles, str(path))
+    return payload
 
 
 def load_jacobian() -> Optional[np.ndarray]:

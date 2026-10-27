@@ -35,3 +35,13 @@ calibration cannot recover chroma from identical channels.
 Preserve the working 5–10 m indoor dataset and detector. Compare the existing
 weights on replacement-camera handheld and flying footage before fine-tuning.
 Hardware calibration and flight acceptance must be measured on the rig.
+
+Camera-dependent calibration writers now store `camera_context`. Loaders compare
+it against the active profile before using Jacobians, goals, intrinsics, focal
+measurements, control mappings, or fused-view registration. Unstamped legacy
+files are accepted only on the exact original C270/OV2710 geometry profiles.
+Do not add new metadata to an old fit to bypass this check. Move incompatible
+files aside and measure again. Structured-light correspondence captures also
+carry context so the registration fitter cannot stamp old captures as new.
+The GUI disables an incompatible overlay; motion calibration loaders refuse it.
+Lens or mount changes require updating their IDs even when image size is unchanged.

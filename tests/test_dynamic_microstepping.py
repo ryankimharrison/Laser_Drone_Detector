@@ -9,12 +9,14 @@ import json
 from pathlib import Path
 import sys
 import types
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import numpy as np
 from turret_host import config, control
 from turret_host.microstepping import configure, apply_to_board
+from turret_host.camera_profile import C270, WIDE
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -218,11 +220,21 @@ class FirmwareDynamic(unittest.TestCase):
 
 
 class HostDynamic(unittest.TestCase):
+    def setUp(self):
+        profiles = patch.object(config, 'CAMERA_PROFILES', {'narrow': C270, 'wide': WIDE})
+        profiles.start()
+        self.addCleanup(profiles.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        configure(16)
+        self.path = Path(tmp.name) / 'jacobian.json'
+        control.Jacobian([[1., .8], [-.9, .7]]).save(self.path)
+
     def tearDown(self): configure(16)
 
     def test_double_speed_ceiling_same_calibration_and_acceleration_units(self):
         configure(16)
-        path = ROOT / 'turret_host/calibration/jacobian.json'
+        path = self.path
         j = control.Jacobian.load(path).J
         cap, wide = config.MAX_MOTOR_RATE, config.WIDE_MAX_MOTOR_RATE
         configure(16, dynamic=True)

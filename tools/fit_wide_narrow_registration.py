@@ -91,6 +91,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from turret_host import config                                  # noqa: E402
+from turret_host.calibration_context import stamp, validate      # noqa: E402
 
 CAL_DIR = os.path.join(_ROOT, "turret_host", "calibration")
 DEFAULT_INPUTS = ("wide_narrow_dense.npz", "wide_narrow_dense_run2.npz")
@@ -182,6 +183,9 @@ def load_inputs(names: Sequence[str]) -> dict:
         if not os.path.exists(path):
             raise SystemExit("no such correspondence file: %s" % path)
         d = np.load(path)
+        context = json.loads(str(d["camera_context"])) if "camera_context" in d else None
+        validate({"camera_context": context} if context is not None else {},
+                 ("narrow", "wide"), path)
         ws = tuple(int(v) for v in d["wide_size"])
         ns = tuple(int(v) for v in d["narrow_size"])
         # A capture at a different frame size is a different camera as far as
@@ -405,10 +409,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     d_n = apply_h(step_u, h_und)[0] - apply_h(mid_u, h_und)[0]
     epi = d_n / float(np.linalg.norm(d_n))
 
-    f_narrow = 1330.0
+    f_narrow = config.NARROW_F_PX
     try:
         with open(LEGACY_PATH, "r", encoding="utf-8") as fh:
-            f_narrow = float(json.load(fh).get("f_narrow_px_measured", f_narrow))
+            legacy = json.load(fh)
+            validate(legacy, ("narrow", "wide"), LEGACY_PATH)
+            f_narrow = float(legacy.get("f_narrow_px_measured", f_narrow))
     except (OSError, ValueError, KeyError, TypeError):
         pass
     baseline_m = config.STEREO_BASELINE_MM / 1000.0
@@ -473,6 +479,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "past that it is extrapolation and registration.py will say so."
             % (ranges[0], sampled_radius, verified or sampled_radius)),
     }
+    blob = stamp(blob, ("narrow", "wide"))
     tmp = args.out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(blob, fh, indent=2)

@@ -72,6 +72,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 from turret_host import config
+from turret_host.calibration_context import stamp, validate
 from turret_host.types import Detection
 
 FIT_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
@@ -126,6 +127,7 @@ class WideToNarrow:
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 blob = json.load(fh)
+            validate(blob, ("narrow", "wide"), path)
             return WideToNarrow(
                 scale=float(blob["scale"]),
                 offset_x=float(blob["offset_x"]),
@@ -141,7 +143,7 @@ class WideToNarrow:
         _os.makedirs(_os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"scale": self.scale, "offset_x": self.offset_x,
+            json.dump(stamp({"scale": self.scale, "offset_x": self.offset_x,
                        "offset_y": self.offset_y,
                        "rotate_cw_deg": self.rotate_cw_deg,
                        "rms_px": self.rms_px, "n_points": self.n_points,
@@ -149,7 +151,7 @@ class WideToNarrow:
                        "note": "wide pixels -> narrow STORED (unrotated) "
                                "pixels. Linear, so valid near the axis; the "
                                "wide camera's barrel distortion is not "
-                               "modelled here."}, fh, indent=2)
+                               "modelled here."}, ("narrow", "wide")), fh, indent=2)
         _os.replace(tmp, path)
 
     # -- the mapping -------------------------------------------------------

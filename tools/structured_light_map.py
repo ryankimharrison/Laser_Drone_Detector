@@ -96,6 +96,7 @@ if str(_ROOT) not in sys.path:
 # turret_host FIRST: its __init__ sets OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS,
 # and that only has an effect before cv2 is imported.
 from turret_host import config                            # noqa: E402
+from turret_host.calibration_context import stamp         # noqa: E402
 from turret_host.camera_fusion import WideToNarrow        # noqa: E402
 
 import cv2                                                # noqa: E402
@@ -1006,7 +1007,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
-            out, wide_pts=wide_pts.astype(np.float32),
+            out, camera_context=np.array(json.dumps(stamp({}, ("narrow", "wide"))["camera_context"])),
+            wide_pts=wide_pts.astype(np.float32),
             narrow_pts=narrow_pts.astype(np.float32),
             projector_shape=np.array(surface.shape),
             wide_size=np.array(config.WIDE_SIZE),

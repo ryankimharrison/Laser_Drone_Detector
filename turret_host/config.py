@@ -869,7 +869,7 @@ FACE_CONF = 0.6
 # ==========================================================================
 # The laser may be on ONLY when ALL of these hold. Any one failing -> off,
 # before anything else happens.
-LASER_ENABLED = True                    # master arm -- enabled by the operator 2026-09-18
+LASER_ENABLED = not _narrow.monochrome   # mono replacement is tracking-only pending separate validation
 FACE_INHIBIT_MARGIN_PX = 120            # no face within this of the beam path
 MAX_ERROR_TO_FIRE_PX = 60   # 2026-09-20 operator: 25 -> 60 for the moving-drone demo (~2.5 deg, inside a ~200 px airframe)
 LASER_MAX_ON_MS = 5000                  # 2026-09-20 Ryan: 2000 -> 5000; the 2 s cap + equal cooldown cost 52 rows in run_145109 and made the box hold a regression

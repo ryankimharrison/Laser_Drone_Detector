@@ -82,6 +82,7 @@ import cv2
 import numpy as np
 
 from turret_host import config
+from turret_host.calibration_context import validate
 
 CAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "calibration", "wide_narrow_registration.json")
@@ -141,6 +142,7 @@ class WideNarrowRegistration:
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 b = json.load(fh)
+            validate(b, ("narrow", "wide"), path)
             d = b["wide_distortion"]
             sign = (parallax_sign if parallax_sign is not None
                     else int(getattr(config, "FUSED_PARALLAX_SIGN",

@@ -62,6 +62,7 @@ from typing import Dict, List, Optional, Sequence, Tuple         # noqa: E402
 import numpy as np                                               # noqa: E402
 
 from turret_host import config                                   # noqa: E402
+from turret_host.calibration_context import stamp, validate       # noqa: E402
 from turret_host.types import (                                  # noqa: E402
     ControlOutput,
     Detection,
@@ -245,6 +246,7 @@ class Jacobian:
             blob = json.load(fh)
         if "j_px_per_step" not in blob:
             raise ValueError(f"{path} has no 'j_px_per_step' key: {sorted(blob)}")
+        validate(blob, source=str(path))
         meta = {k: v for k, v in blob.items() if k != "j_px_per_step"}
         from turret_host.microstepping import scale_jacobian
         matrix = scale_jacobian(blob["j_px_per_step"], blob.get("microstep_divisor", 16))
@@ -269,6 +271,7 @@ class Jacobian:
         blob["microstep_divisor"] = config.MICROSTEP_DIVISOR
         blob["saved_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         blob["expected_px_per_step"] = config.NARROW_F_PX * math.radians(config.AXIS_STEP_DEG)
+        blob = stamp(blob)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(blob, fh, indent=2, sort_keys=True)
@@ -373,6 +376,7 @@ class GoalModel:
         missing = [k for k in ("u_inf", "c_u", "v_inf", "c_v") if k not in blob]
         if missing:
             raise ValueError(f"{path} is missing goal-fit keys {missing}")
+        validate(blob, source=str(path))
         meta = {k: v for k, v in blob.items()
                 if k not in ("u_inf", "c_u", "v_inf", "c_v")}
         return cls(blob["u_inf"], blob["c_u"], blob["v_inf"], blob["c_v"],
@@ -389,6 +393,7 @@ class GoalModel:
                      "saved_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                      "expected_parallax_px_m": EXPECTED_PARALLAX_PX_M,
                      "parallax_axis": self.parallax_axis})
+        blob = stamp(blob)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(blob, fh, indent=2, sort_keys=True)

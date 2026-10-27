@@ -10,16 +10,27 @@ from unittest.mock import patch
 import numpy as np
 from turret_host import config, control
 from turret_host.microstepping import configure, apply_to_board
+from turret_host.camera_profile import C270, WIDE
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class HostProfiles(unittest.TestCase):
+    def setUp(self):
+        self.profiles = patch.object(config, 'CAMERA_PROFILES', {'narrow': C270, 'wide': WIDE})
+        self.profiles.start()
+        self.addCleanup(self.profiles.stop)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        configure(16)
+        self.path = Path(self.tmp.name) / 'jacobian.json'
+        control.Jacobian([[1., .8], [-.9, .7]]).save(self.path)
+
     def tearDown(self):
         configure(16)
 
     def test_equal_physical_motion_and_unchanged_calibration(self):
-        path = ROOT / 'turret_host/calibration/jacobian.json'
+        path = self.path
         original = path.read_bytes()
         configure(16)
         j16 = control.Jacobian.load(path)
