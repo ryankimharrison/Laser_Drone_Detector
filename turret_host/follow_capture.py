@@ -395,7 +395,7 @@ def run(args) -> int:
     print("Jacobian calibrated. goal pixel calibrated = %s"
           % ctl.goal_model.is_calibrated)
 
-    cameras.lock_exposure(ident.narrow_index, exposure=-6)
+    cameras.lock_exposure(ident.narrow_index, exposure=config.NARROW_EXPOSURE_EV)
     narrow = cameras.narrow_thread(ident.narrow_index).start()
     wide = cameras.wide_thread(ident.wide_index).start()
 

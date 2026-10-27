@@ -59,6 +59,19 @@ from turret_host import config
 from turret_host.types import Frame, Slot
 
 
+def bgr_image(image):
+    """Normalize decoded mono/BGRA output at the capture boundary."""
+    if image.dtype != np.uint8:
+        raise CameraError("expected decoded 8-bit UVC frames; configure the module pixel format")
+    if image.ndim == 2 or (image.ndim == 3 and image.shape[2] == 1):
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.ndim == 3 and image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise CameraError("unsupported decoded camera shape %s" % (image.shape,))
+    return image
+
+
 # ==========================================================================
 #   MODULE POLICY
 # ==========================================================================
@@ -378,8 +391,10 @@ def _usb_signature(pnp) -> str:
     Replug anything, add or remove a device, and this changes, so a stale cache
     cannot survive the one event that invalidates an index.
     """
-    return "|".join(sorted("%04X:%04X/%s" % (d.vid_pid[0], d.vid_pid[1],
+    devices = "|".join(sorted("%04X:%04X/%s" % (d.vid_pid[0], d.vid_pid[1],
                                              d.serial or "-") for d in pnp))
+    return devices + json.dumps({k: v.geometry() for k, v in config.CAMERA_PROFILES.items()},
+                                sort_keys=True)
 
 
 def _load_index_cache(signature: str):
@@ -431,8 +446,14 @@ def identify_cameras(max_index: int = _MAX_PROBE_INDEX,
             "no camera-class USB devices present -- nothing is plugged in, or "
             "PowerShell's Get-PnpDevice returned nothing")
 
+    if config.NARROW_VID_PID is None:
+        raise CameraIdentificationError(
+            "replacement narrow camera is not commissioned. Set its USB vid_pid "
+            "and optional serial in TURRET_CAMERA_CONFIG; see CAMERA_UPGRADE.md.\n"
+            + "\n".join(d.describe() for d in pnp))
     narrow_devs = [d for d in pnp
-                   if d.vid_pid == config.NARROW_VID_PID and d.serial == config.NARROW_SERIAL]
+                   if d.vid_pid == config.NARROW_VID_PID
+                   and (config.NARROW_SERIAL is None or d.serial == config.NARROW_SERIAL)]
     wide_devs = [d for d in pnp if d.vid_pid == config.WIDE_VID_PID]
 
     inventory = "\n".join("    " + d.describe() for d in pnp)
@@ -447,6 +468,8 @@ def identify_cameras(max_index: int = _MAX_PROBE_INDEX,
             "  present:\n%s" % (config.WIDE_VID_PID[0], config.WIDE_VID_PID[1],
                                 len(wide_devs), inventory))
     narrow_dev, wide_dev = narrow_devs[0], wide_devs[0]
+    if narrow_dev.instance_id == wide_dev.instance_id:
+        raise CameraIdentificationError("narrow and wide roles resolved to the same USB device")
 
     # A cache hit skips probe_max_widths entirely. MEASURED on this machine:
     # identify_cameras() is 64.0 s of a 67.5 s cold start, essentially all of it
@@ -504,12 +527,13 @@ def identify_cameras(max_index: int = _MAX_PROBE_INDEX,
                 "  order: %s\n  widths: %s"
                 % (wide_index, widths.get(wide_index), config.WIDE_FINGERPRINT_WIDTH,
                    [d.name for d in ordered], widths))
-        if widths.get(narrow_index) != config.NARROW_SIZE[0]:
+        expected_width = config.CAMERA_PROFILES["narrow"].max_width
+        if expected_width is not None and widths.get(narrow_index) != expected_width:
             raise CameraIdentificationError(
                 "narrow camera maps to index %d but that index caps at %s, not %d -- "
                 "the enumeration order does not match OpenCV's. Refusing to guess.\n"
                 "  order: %s\n  widths: %s"
-                % (narrow_index, widths.get(narrow_index), config.NARROW_SIZE[0],
+                % (narrow_index, widths.get(narrow_index), expected_width,
                    [d.name for d in ordered], widths))
         _save_index_cache(signature, narrow_index, wide_index, widths)
         return CameraIdentification(narrow_index, wide_index, narrow_dev, wide_dev,
@@ -519,8 +543,13 @@ def identify_cameras(max_index: int = _MAX_PROBE_INDEX,
     #     forced by elimination; anything else is a coin flip on which camera
     #     the tracker points at, so it is an error.
     notes.append("no device ordering available -- resolving by elimination")
+    expected_width = config.CAMERA_PROFILES["narrow"].max_width
+    if expected_width is None:
+        raise CameraIdentificationError(
+            "device ordering unavailable and narrow max_width unmeasured; "
+            "install pygrabber or configure a verified max_width fingerprint")
     wide_indices = [i for i, w in widths.items() if w == config.WIDE_FINGERPRINT_WIDTH]
-    narrow_indices = [i for i, w in widths.items() if w == config.NARROW_SIZE[0]]
+    narrow_indices = [i for i, w in widths.items() if w == expected_width]
     if len(wide_indices) != 1:
         raise CameraIdentificationError(
             "cannot order cameras (%s) and %d indices report the %d-wide "
@@ -547,7 +576,8 @@ def open_camera(index: int,
                 size: Tuple[int, int],
                 fps: int,
                 backend: int = cv2.CAP_MSMF,
-                exposure: Optional[float] = None) -> cv2.VideoCapture:
+                exposure: Optional[float] = None,
+                fourcc: str = "MJPG") -> cv2.VideoCapture:
     """Open one camera on `backend` in MJPEG at `size`, or raise.
 
     Opens are serialised process-wide: MSMF's source reader cannot be raced.
@@ -563,7 +593,7 @@ def open_camera(index: int,
             # YUYV and run 3-6x slower over USB 2.0. MSMF *refuses* this set
             # and returns False -- that is normal, it negotiates the
             # compressed mode itself. Do not "fix" it by switching to DSHOW.
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             cap.set(cv2.CAP_PROP_FPS, fps)
@@ -614,14 +644,21 @@ def measure_delivered_fps(cap: cv2.VideoCapture,
         if not cap.grab():
             raise CameraError("camera stopped delivering during fps warm-up")
     t0 = time.perf_counter()
+    previous = None
+    distinct = 0
     for _ in range(frames):
         if not cap.grab():
             raise CameraError("camera stopped delivering during fps measurement")
-        cap.retrieve()          # retrieve too: decoding MJPEG is part of the cost
+        ok, image = cap.retrieve()
+        if not ok or image is None:
+            raise CameraError("camera could not decode a frame during fps measurement")
+        if previous is None or not np.array_equal(previous, image):
+            distinct += 1
+        previous = image.copy()
     dt = time.perf_counter() - t0
     if dt <= 0.0:
         raise CameraError("fps measurement took no measurable time")
-    return frames / dt
+    return distinct / dt
 
 
 def verify_camera(index: int,
@@ -650,7 +687,7 @@ def verify_camera(index: int,
 @dataclass
 class ExposureLockResult:
     """What the exposure lock actually achieved, as opposed to what it asked for."""
-    requested: float
+    requested: Optional[float]
     before: float
     after_dshow: float
     after_msmf: float
@@ -667,7 +704,7 @@ class ExposureLockResult:
 
 
 def lock_exposure(index: int,
-                  exposure: float,
+                  exposure: Optional[float],
                   gain: Optional[float] = None,
                   verify_backend: int = cv2.CAP_MSMF) -> ExposureLockResult:
     """Pin exposure (and optionally gain) on the device, and verify it took.
@@ -686,6 +723,9 @@ def lock_exposure(index: int,
     is a frame-rate optimisation, not a safety interlock, and the caller
     decides. It never reports success it did not verify.
     """
+    if exposure is None:
+        return ExposureLockResult(None, 0., 0., 0., 0., gain, 0., False, False,
+                                  "exposure unconfigured; measure and set it in the camera profile")
     with _OPEN_LOCK:
         cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         try:
@@ -779,7 +819,8 @@ class CameraThread(threading.Thread):
                  backend: int = cv2.CAP_MSMF,
                  min_fps: float = config.MIN_ACCEPTABLE_FPS,
                  probe_frames: int = config.FPS_PROBE_FRAMES,
-                 exposure: Optional[float] = None):
+                 exposure: Optional[float] = None,
+                 fourcc: str = "MJPG"):
         super().__init__(name="capture-%s" % name, daemon=True)
         self.camera_name = name          # goes into Frame.camera: "narrow" | "wide"
         self.index = index
@@ -790,6 +831,7 @@ class CameraThread(threading.Thread):
         #: PREVIOUS process left behind -- the camera retains it across
         #: restarts, so "not set" is not "default". See config.NARROW_EXPOSURE_EV.
         self.exposure = exposure
+        self.fourcc = fourcc
         self.min_fps = min_fps
         self.probe_frames = probe_frames
 
@@ -819,7 +861,7 @@ class CameraThread(threading.Thread):
     def start(self) -> "CameraThread":
         """Open the camera, prove it delivers, then run. Raises if it does not."""
         cap = open_camera(self.index, self.size, self.requested_fps,
-                          self.backend, exposure=self.exposure)
+                          self.backend, exposure=self.exposure, fourcc=self.fourcc)
         try:
             self.startup_fps = measure_delivered_fps(cap, self.probe_frames)
             if self.startup_fps < self.min_fps:
@@ -860,6 +902,8 @@ class CameraThread(threading.Thread):
                     consecutive_failures += 1
                     continue
                 consecutive_failures = 0
+
+                image = bgr_image(image)
 
                 # DUPLICATE REJECTION -- see config.DEDUP_FRAMES.
                 #
@@ -942,9 +986,9 @@ class CameraThread(threading.Thread):
 
 
 def narrow_thread(index: int, slot: Optional[Slot] = None) -> CameraThread:
-    """Capture thread for the C270, at its measured ceiling."""
+    """Capture using the configured narrow USB module and measured mode."""
     return CameraThread("narrow", index, config.NARROW_SIZE, config.NARROW_FPS,
-                        slot, exposure=config.NARROW_EXPOSURE_EV)
+                        slot, exposure=config.NARROW_EXPOSURE_EV, fourcc=config.NARROW_FOURCC)
 
 
 def wide_thread(index: int, slot: Optional[Slot] = None, fast: bool = False) -> CameraThread:
@@ -957,7 +1001,7 @@ def wide_thread(index: int, slot: Optional[Slot] = None, fast: bool = False) -> 
     size = config.WIDE_FAST_SIZE if fast else config.WIDE_SIZE
     fps = config.WIDE_FAST_FPS if fast else config.WIDE_FPS
     return CameraThread("wide", index, size, fps, slot,
-                        exposure=config.WIDE_EXPOSURE_EV)
+                        exposure=config.WIDE_EXPOSURE_EV, fourcc=config.WIDE_FOURCC)
 
 
 # ==========================================================================

@@ -147,9 +147,9 @@ _CLOSING_HOME_BUDGET_S = 90.0
 # constant and cameras.lock_exposure() deliberately leaves it to the caller:
 # 2^-6 = 15.6 ms, which fits inside a 33 ms frame with margin and was the
 # value verified on this hardware (29.8 fps after the lock).
-NARROW_EXPOSURE = -6
-NARROW_GAIN = 64
-WIDE_EXPOSURE = -6
+NARROW_EXPOSURE = config.NARROW_EXPOSURE_EV
+NARROW_GAIN = None
+WIDE_EXPOSURE = config.WIDE_EXPOSURE_EV
 
 
 # ==========================================================================

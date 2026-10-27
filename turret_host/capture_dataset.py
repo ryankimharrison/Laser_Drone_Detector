@@ -411,7 +411,7 @@ def run_session(session_name: Optional[str] = None,
     # Lock exposure BEFORE the MSMF stream exists. MSMF accepts exposure writes
     # and silently ignores them; the DSHOW detour is the only thing that works.
     if use_narrow:
-        res = cameras.lock_exposure(ident.narrow_index, exposure=-6)
+        res = cameras.lock_exposure(ident.narrow_index, exposure=config.NARROW_EXPOSURE_EV)
         print("narrow exposure lock: %s  (took=%s persisted=%s)  %s"
               % ("OK" if res.ok else "NOT LOCKED", res.took, res.persisted, res.message))
         if not res.ok:

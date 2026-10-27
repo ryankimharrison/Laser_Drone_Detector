@@ -11,6 +11,12 @@ doc's camera claims were disproved on this machine (see CAMERA notes below).
 # ==========================================================================
 #   BOARD LINK
 # ==========================================================================
+from turret_host.camera_profile import load_profiles
+
+CAMERA_PROFILES = load_profiles()
+_narrow = CAMERA_PROFILES["narrow"]
+_wide = CAMERA_PROFILES["wide"]
+
 PICO_VID, PICO_PID = 0x2E8A, 0x0005     # resolve by VID/PID, never COM number
 SERIAL_BAUD = 115200                    # USB CDC: baud is ignored, any value works
 MICROSTEP_DIVISOR = 16                  # runtime profile; saved legacy J is 1/16
@@ -52,19 +58,21 @@ PRELOAD_STEPS = 14                      # 1.2 x the ~12 microsteps of lash
 #            (set() returns True, value never changes)
 #   DSHOW -- exposure writes work, but frame rate collapses (C270: 10 fps)
 # So: set exposure through a short DSHOW open, release, reopen on MSMF.
-NARROW_SERIAL = "C8258920"              # C270 has a real serial -- fully stable
-NARROW_VID_PID = (0x046D, 0x0825)
-WIDE_VID_PID = (0x32E4, 0x9230)         # SVPRO USBFHD01M, OV2710 + 2.1 mm M12
-WIDE_FINGERPRINT_WIDTH = 1920           # no serial: identify by max resolution
+NARROW_SERIAL = _narrow.serial
+NARROW_VID_PID = _narrow.vid_pid
+WIDE_VID_PID = _wide.vid_pid
+WIDE_FINGERPRINT_WIDTH = _wide.max_width
+NARROW_FOURCC = _narrow.fourcc
+WIDE_FOURCC = _wide.fourcc
 
 # The HP integrated webcam also caps at 1280, so a max-width fingerprint CANNOT
 # distinguish it from the C270. The narrow camera must be resolved by serial.
 INTEGRATED_VID_PID = (0x30C9, 0x0069)
 
-NARROW_SIZE = (1280, 720)               # MEASURED: 30.1 fps MJPEG on MSMF; its ceiling
-NARROW_FPS = 30
-WIDE_SIZE = (1920, 1080)                # MEASURED: 30.3 fps MJPEG
-WIDE_FPS = 30
+NARROW_SIZE = _narrow.size
+NARROW_FPS = _narrow.fps
+WIDE_SIZE = _wide.size
+WIDE_FPS = _wide.fps
 
 # The wide module also does 1280x720 @ 60 fps MJPEG -- AGENT_HANDOFF says this
 # mode delivers 9 fps and calls it a trap. That 9 fps is the YUYV variant;
@@ -98,8 +106,8 @@ WIDE_FAST_FPS = 60
 #  * MSMF's exposure READBACK IS A CONSTANT -- it returns the same value
 #    whatever you write, while the image responds correctly. Any verification
 #    by read-back is worthless. See lock_exposure().
-NARROW_EXPOSURE_EV = -5
-WIDE_EXPOSURE_EV = -6                   # wide sensor is fast at any of these
+NARROW_EXPOSURE_EV = _narrow.exposure
+WIDE_EXPOSURE_EV = _wide.exposure
 
 MIN_ACCEPTABLE_FPS = 25                 # refuse to start below this, per camera
 FPS_PROBE_FRAMES = 40
@@ -142,7 +150,7 @@ DEDUP_STRIDE = 16
 # The filter removal is a real domain shift for COCO weights and weakens every
 # colour-based test; the rotation means its parallax correction lands on the
 # goal ROW, not the column.
-NARROW_F_PX = 1400.0                    # ESTIMATE -- run chessboard calibration
+NARROW_F_PX = _narrow.focal_px           # replacement-camera value is provisional
 NARROW_IR_CUT_REMOVED = True
 NARROW_REFOCUSED = True                 # builder confirmed sharp at 2-5 m after filter removal
 
@@ -153,8 +161,8 @@ NARROW_REFOCUSED = True                 # builder confirmed sharp at 2-5 m after
 # RESOLVED 2026-09-16, builder observed the live preview: the raw frame must be
 # rotated 90 degrees CLOCKWISE to appear upright.
 #   display = cv2.rotate(raw, cv2.ROTATE_90_CLOCKWISE)
-NARROW_ROTATION_DEG = 90
-NARROW_ROTATE_CLOCKWISE = True
+NARROW_ROTATION_DEG = _narrow.rotation_deg
+NARROW_ROTATE_CLOCKWISE = _narrow.clockwise
 
 # ROTATE FOR DISPLAY ONLY. Never rotate frames on the processing path: it is a
 # full-frame copy per frame for no benefit, and the detector does not care which
@@ -174,7 +182,7 @@ NARROW_ROTATE_CLOCKWISE = True
 # f_px = 2.1 mm / 3.0 um = 700. Horizontal FOV 2*atan(2.88/2.1) = 107.9 deg.
 # At 115 deg diagonal this lens is NOT rectilinear -- expect to need
 # cv2.fisheye. Calibrate; M12 focal lengths run +/-10%.
-WIDE_F_PX = 700.0                       # DERIVED from sensor geometry, not measured
+WIDE_F_PX = _wide.focal_px
 WIDE_FOV_H_DEG = 107.9
 
 # MEASURED from CAD (sterolaserview.step), all three features on y = 0:

@@ -54,6 +54,7 @@ desktop.ini
 
 # --- Secrets / local config (none in the tree today; keep it that way) ---
 .env
+camera.local.json
 .env.*
 !.env.example
 *.pem
