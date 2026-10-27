@@ -41,6 +41,7 @@ import re
 import threading
 import time
 from pathlib import Path
+from dataclasses import asdict, is_dataclass
 from typing import Optional
 
 from turret_host import config
@@ -66,6 +67,10 @@ def _jsonable(x):
         return x
     if isinstance(x, (list, tuple)):
         return [_jsonable(v) for v in x]
+    if is_dataclass(x):
+        return _jsonable(asdict(x))
+    if isinstance(x, dict):
+        return {k: _jsonable(v) for k, v in x.items()}
     return repr(x)
 
 
@@ -417,7 +422,8 @@ class FlightRecorder:
                     pose=None, attitude=None, frame_t=None, frame_index=None,
                     detections=None, wide=None, tracker=None,
                     det_frame_t=None, dup_dropped=None,
-                    infer_ms=None) -> None:
+                    infer_ms=None, received_t=None, infer_done_t=None,
+                    time_source=None, pipeline_delay_s=None) -> None:
         """One control-loop pass. Called from the control thread; must be cheap."""
         if self.failed:
             return
@@ -425,6 +431,11 @@ class FlightRecorder:
             rec = {
                 "t": t, "rel_t": t - self.t0,
                 "frame_t": _f(frame_t), "frame_index": frame_index,
+                "received_t": _f(received_t),
+                "infer_done_t": _f(infer_done_t),
+                "time_source": time_source,
+                "pipeline_delay_s": _f(pipeline_delay_s),
+                "observation_age_ms": None if frame_t is None else _f((t - frame_t) * 1000.),
                 # THE DETECTION'S OWN FRAME TIME, as its own field.
                 # `est.box_t` is stamped from the tracker's self._t, which
                 # equals the frame time only because _update() happens to be
@@ -443,6 +454,7 @@ class FlightRecorder:
             if est is not None:
                 rec["est"] = {
                     "u": _f(est.u), "v": _f(est.v),
+                    "predicted_to_t": _f(est.predicted_to_t),
                     "du": _f(est.du), "dv": _f(est.dv),
                     "q": _f(est.q), "nis": _f(est.nis),
                     "occluded": bool(est.occluded),
@@ -647,6 +659,8 @@ class FlightRecorder:
     def _write_session(self) -> None:
         probe = self.link.probe_stats if self.link is not None else (0, 0)
         (self.dir / "session.json").write_text(json.dumps({
+            "schema_version": 2,
+            "timing": "frame_t=estimated capture; received_t=host grab; predicted_to_t=control target",
             "clock_anchor": {"perf_counter": self.t0, "wall": self.wall0,
                              "note": "wall = wall0 + (t - t0)"},
             # EVERY public constant, not a hand-picked list. The curated

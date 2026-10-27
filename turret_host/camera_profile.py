@@ -29,6 +29,7 @@ class CameraProfile:
     mount_id: str
     max_width: int | None
     pipeline_delay_s: float = 0.0
+    command_delay_s: float = 0.0
 
     def __post_init__(self):
         if (len(self.size) != 2 or any(type(v) is not int or v <= 0 for v in self.size)
@@ -41,7 +42,8 @@ class CameraProfile:
             raise ValueError("fourcc must have four characters; rotation must be a quarter turn")
         if self.shutter not in ("global", "rolling"):
             raise ValueError("shutter must be global or rolling")
-        for value in (self.focal_px, self.rolling_shutter_s, self.pipeline_delay_s):
+        for value in (self.focal_px, self.rolling_shutter_s, self.pipeline_delay_s,
+                      self.command_delay_s):
             if not math.isfinite(value) or value < 0:
                 raise ValueError("camera geometry and delays must be finite and nonnegative")
         if self.focal_px == 0 or (self.shutter == "global" and self.rolling_shutter_s != 0):

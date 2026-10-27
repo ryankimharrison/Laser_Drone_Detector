@@ -106,3 +106,40 @@ augmentation appropriate for the unchanged wide camera. Every training or
 evaluation run writes `experiment.json` containing arguments, dataset/checkpoint
 hashes and library versions, and refuses an existing run name. No data has been
 collected, labels changed, weights trained or models promoted by this code update.
+
+## Timing and verification
+
+`Frame.t` and detection `frame_t` now mean estimated capture time:
+`received_t - pipeline_delay_s`. A zero offset is explicitly logged as
+`host_receive`, indicating that camera delay is still unmeasured. Nonzero
+offsets are labeled `calibrated_offset`; no hardware timestamp is implied.
+Measure the offset against an independently timed visible fiducial. Do not
+copy the old C270's 66 ms combined sensing/inference number into this field.
+
+Prediction advances from the measurement time to `now + command_delay_s`.
+Only independently measured additional command/actuation delay belongs in that
+lead; neither camera delay nor inference time is added a second time. Both
+replacement timing offsets default to zero pending measurement. `LATENCY_S`
+is a compatibility alias for `CONTROL_LEAD_S`, not the retired C270 total.
+Changing gain, lead or speed still requires recorded physical validation.
+
+Version-2 telemetry records receipt, estimated capture, inference completion,
+observation age, prediction target time and structured camera profiles. Analysis
+uses the recorded prediction target time and camera rotation, retaining a legacy
+fallback for old recordings. Detector-interpolated positions remain diagnostic
+references, not independently labeled ground truth. Wide fallback now checks
+wall-clock evidence age as well as cross-camera skew.
+
+Run the hardware-free checks from the project root:
+
+```powershell
+python -m pip install -r requirements-test.txt
+python -m unittest discover -s tests -q
+python -m turret_host.app --no-hardware --no-gui --tracking-only --run-seconds 3
+```
+
+The software tests do not establish actual FPS, blur, geometric accuracy,
+motion delivery, flight recall or reacquisition time. Next on the rig: configure
+the actual module, measure its mode/exposure, recalibrate, benchmark the unchanged
+model, then collect flight data. High-rate gyro streaming, higher motor limits,
+and model promotion are deliberately deferred until recordings justify them.

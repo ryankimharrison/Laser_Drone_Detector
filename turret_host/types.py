@@ -35,11 +35,14 @@ class LaserState(Enum):
 
 @dataclass
 class Frame:
-    """One captured frame. `t` is taken at grab() return -- the best available."""
+    """`t` is estimated capture time; receipt and timing provenance stay explicit."""
     image: np.ndarray
     t: float
     index: int
     camera: str                      # "narrow" | "wide"
+    received_t: Optional[float] = None
+    time_source: str = "legacy_receive"
+    pipeline_delay_s: float = 0.0
 
 
 @dataclass
@@ -90,6 +93,10 @@ class DetectionResult:
     targets: list = field(default_factory=list)   # list[Detection]
     faces: list = field(default_factory=list)     # list[Detection]
     infer_ms: float = 0.0
+    received_t: Optional[float] = None
+    infer_done_t: Optional[float] = None
+    time_source: str = "legacy_receive"
+    pipeline_delay_s: float = 0.0
 
 
 @dataclass

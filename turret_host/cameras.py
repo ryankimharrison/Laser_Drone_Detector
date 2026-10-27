@@ -1,17 +1,12 @@
 """Camera identification, capture threads and exposure lock.
 
-Three facts drive every decision in this file, all of them measured on this
-machine (see config.py CAMERAS and BUILD_SPEC "Hard-won constraints"):
-
-  1. MSMF delivers full frame rate but silently ignores exposure writes.
-     DSHOW honours exposure but collapses the frame rate. So streaming happens
-     on MSMF and exposure is set through a short DSHOW open beforehand -- UVC
-     controls live on the device, not on the handle, so they persist.
-  2. CAP_PROP_BUFFERSIZE is not settable on Windows. The driver's hidden 2-5
-     frame buffer can only be defeated by a tight grab()/retrieve() thread.
-  3. Indices are not stable and no fingerprint distinguishes the C270 from the
-     built-in HP webcam -- both cap at 1280. The narrow camera is resolved by
-     its USB serial or not at all.
+Camera identities and stream settings come from config.CAMERA_PROFILES.
+MSMF exposure readback was unreliable on the original rig; the streaming
+handle applies the configured exposure and actual distinct frames determine
+the FPS gate. Replacement-module behavior must be measured independently.
+Indices are resolved by USB identity plus ordered enumeration or a verified
+resolution fingerprint; ambiguous mappings are refused. Tight capture threads
+publish the latest image without accumulating a queue.
 
 Nothing here touches hardware at import time: every open lives inside a
 function or a start() call, so this module imports on a bare machine.
@@ -70,6 +65,14 @@ def bgr_image(image):
     if image.ndim != 3 or image.shape[2] != 3:
         raise CameraError("unsupported decoded camera shape %s" % (image.shape,))
     return image
+
+
+def received_frame(image, received_t, index, camera):
+    """Apply a measured pipeline offset once; zero explicitly means uncalibrated."""
+    delay = config.CAMERA_PROFILES[camera].pipeline_delay_s
+    return Frame(image=image, t=received_t - delay, index=index, camera=camera,
+                 received_t=received_t, pipeline_delay_s=delay,
+                 time_source="calibrated_offset" if delay > 0 else "host_receive")
 
 
 # ==========================================================================
@@ -796,9 +799,9 @@ class CameraThread(threading.Thread):
     """Tight grab/retrieve loop publishing Frames into a Slot.
 
     The loop body is `grab(); t = perf_counter(); retrieve()` and that order is
-    mandatory. grab() returns when the frame lands, so the timestamp taken
-    immediately after it is the best estimate of exposure time available;
-    timing after retrieve() folds in the MJPEG decode. Running the loop as fast
+    mandatory. grab() return is recorded as receipt time; a measured camera
+    pipeline offset estimates capture time. Timing after retrieve() would
+    fold in extra decode work. Running the loop as fast
     as the camera allows is the only way to keep the driver's hidden 2-5 frame
     buffer empty -- CAP_PROP_BUFFERSIZE is not settable on Windows.
 
@@ -931,8 +934,7 @@ class CameraThread(threading.Thread):
                         continue
 
                 self.frames += 1
-                self.slot.put(Frame(image=image, t=t, index=self.frames,
-                                    camera=self.camera_name))
+                self.slot.put(received_frame(image, t, self.frames, self.camera_name))
                 # A COPY, never a reference: retrieve() is free to hand back
                 # the same buffer next call, and holding a reference to it
                 # would make every frame compare equal to itself and drop the

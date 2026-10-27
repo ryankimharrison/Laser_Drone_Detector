@@ -370,7 +370,12 @@ COARSE_COOLDOWN_S = 2.0
 # (which the 33 ms frame interval places somewhere above 17.9 ms). The control
 # loop is fed by frames, so it genuinely waits out that quantisation too --
 # the whole-frames figure is the one the gain ceiling should be built on.
-LATENCY_S = 0.066                       # MEASURED (was 0.060, an estimate)
+# Historical measurement above describes the old C270 sensing pipeline.
+# Frame.t now subtracts the per-camera measured pipeline_delay_s. Prediction
+# advances from that time to now, then adds only the independent command delay.
+# Neither camera nor inference delay belongs in this additional lead.
+CONTROL_LEAD_S = _narrow.command_delay_s
+LATENCY_S = CONTROL_LEAD_S               # compatibility for older tools; new logs store target time
 
 # ==========================================================================
 #   PLATFORM COMPENSATION   (DEFAULT OFF -- never validated on hardware)

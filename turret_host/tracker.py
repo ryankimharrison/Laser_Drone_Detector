@@ -248,7 +248,7 @@ class PixelTracker:
         Feedforward is the whole game (BUILD_SPEC): with ~60 ms of latency the
         proportional term alone is stable only to ~2 Hz and cannot chase a hand.
         """
-        return self.predict_to(t_now + config.LATENCY_S)
+        return self.predict_to(t_now + config.CONTROL_LEAD_S)
 
     def reset(self) -> None:
         """Drop the track and return to SEARCH."""

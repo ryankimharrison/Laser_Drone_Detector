@@ -2,6 +2,12 @@
 
 An experimental two-camera pan/tilt tracking platform that detects a handheld DGI drone, follows it with a differential stepper mechanism, and controls a low-power green laser through a deliberately fail-closed software interlock.
 
+The narrow C270 has been replaced with an OV9281-class camera (exact USB module
+still to be commissioned). See [CAMERA_UPGRADE.md](CAMERA_UPGRADE.md) for camera
+profiles, required recalibration, the 5–10 m indoor flight dataset workflow, and
+timing configuration. The replacement profile is tracking-only. Historical
+measurements below describe the original rig unless explicitly stated otherwise.
+
 This README explains both the big picture and the implementation. In plain language: a Windows computer watches two cameras, identifies the drone, estimates where it is moving, and asks a Raspberry Pi Pico to turn two motors. The laser is a separate output. Tracking the drone does **not** automatically permit the laser to turn on; a set of additional checks must all pass on every control cycle.
 
 ## What is in this repository?
@@ -67,7 +73,7 @@ Instead of queues, threads exchange data through a `Slot`: a one-item, newest-wi
 
 The **wide camera** provides situational awareness and reacquisition. It is an SVPRO USBFHD01M/OV2710 module with an approximately 108° horizontal field of view. It normally runs at 1920×1080 at 30 fps, with an optional 1280×720 at 60 fps mode.
 
-The **narrow camera** is a Logitech C270 running at 1280×720 at 30 fps. It provides the precision image coordinate system used by the tracker, controller, laser calibration, and safety checks. It is physically mounted 90° clockwise and has had its IR-cut filter removed. That improves some sensing possibilities but shifts its colors away from what ordinary pretrained vision models expect.
+The **narrow camera** provides the precision image coordinate system. Its replacement profile is provisionally 1280×800 at 30 fps, monochrome and global shutter; USB identity, lens, mode, exposure and mounting must be commissioned. The previous C270 ran at 1280×720 at 30 fps, mounted 90° clockwise with its IR-cut filter removed, and remains available as an explicit comparison profile. Camera-dependent calibration is checked against the selected camera, lens, size and mount.
 
 The wide-to-narrow transformation can steer the turret toward a target seen only by the wide camera. It includes camera rotation, focal-length scaling, and optional fitted registration. However, parallax and calibration error mean a wide-origin box is never considered precise enough to authorize the laser. The design rule is:
 

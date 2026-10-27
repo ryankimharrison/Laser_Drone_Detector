@@ -1,0 +1,5 @@
+# Hardware-free unittest suite. Model training additionally needs torch/ultralytics.
+numpy>=1.25,<3
+opencv-python>=4.10
+pyserial>=3.5
+PyYAML>=6

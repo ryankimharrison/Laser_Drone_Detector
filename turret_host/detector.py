@@ -508,6 +508,10 @@ class Detector:
             targets=targets,
             faces=[],
             infer_ms=infer_ms,
+            received_t=frame.received_t,
+            infer_done_t=time.perf_counter(),
+            time_source=frame.time_source,
+            pipeline_delay_s=frame.pipeline_delay_s,
         )
 
 

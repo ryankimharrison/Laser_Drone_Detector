@@ -1,4 +1,4 @@
-"""Measure LATENCY_S: flash the laser, see which frame the dot lands in.
+"""Legacy color-camera command-to-image diagnostic using a laser flash.
 
     python -m turret_host.measure_latency               # 16 flashes
     python -m turret_host.measure_latency --trials 30
@@ -49,8 +49,8 @@ camera exposure and readout, USB transport, MJPEG decode, host timestamp.
 That is the sensing-and-command latency the control loop cannot avoid.
 
 NOT INCLUDED: inference (app.py reports ~15 ms) and the motor's mechanical
-response. Add the inference figure before setting config.LATENCY_S. The
-mechanical term is left unmeasured on purpose -- see above.
+response. This combined measurement is not the independent command lead or
+the camera-only delay. Separate those components before configuring offsets.
 
 WHAT "ONSET" MEANS
 ------------------
@@ -281,6 +281,9 @@ def main(argv=None) -> int:
                     help="narrow camera exposure lock (default -6; lower is "
                          "darker, which widens the dot's margin over the wall)")
     a = ap.parse_args(argv)
+    if config.CAMERA_PROFILES['narrow'].monochrome:
+        ap.error('legacy laser/chroma latency measurement is unsupported for the monochrome replacement; '
+                 'measure camera delay with an independently timed visible fiducial')
 
     ident = cameras.identify_cameras()
     print(ident.report())
@@ -339,24 +342,16 @@ def main(argv=None) -> int:
 
     samples = [float(np.median(r["samples"])) for r in results if r["samples"]]
     print("\n%s" % ("=" * 66))
-    print("config.LATENCY_S is currently %.3f s, marked ESTIMATE"
-          % config.LATENCY_S)
+    print("Additional command lead is currently %.3f s" % config.CONTROL_LEAD_S)
     if not samples:
         print("NOTHING MEASURED -- see the note above.")
         return 1
     base = samples[0]
     print("  laser flash (command -> photons seen)   %.3f s" % base)
-    infer = 0.015
-    print("\nLATENCY_S wants the whole path the control law waits on, so ADD")
-    print("the inference the loop pays first (app.py reports ~%.0f ms):" % (infer * 1e3))
-    print("    LATENCY_S ~= %.3f s" % (base + infer))
-    print("Usable P-loop bandwidth ~ 1/(8L) = %.1f Hz" % (1.0 / (8 * (base + infer))))
-    if base + infer > config.LATENCY_S * 1.25:
-        print("\nTHIS IS %.0f%% HIGHER than the configured estimate. The tracker"
-              % (100.0 * (base + infer) / config.LATENCY_S - 100.0))
-        print("leads the aim point by LATENCY_S, so an underestimate means it")
-        print("aims BEHIND a moving target -- worst exactly when the drone is")
-        print("fastest, which is the case the deliverable is about.")
+    print("This legacy measurement includes command transport and camera delivery.")
+    print("Separate those before assigning pipeline_delay_s; do not add inference")
+    print("or camera delivery to command_delay_s. Prediction already advances")
+    print("from estimated capture time to the current control time.")
     return 0
 
 

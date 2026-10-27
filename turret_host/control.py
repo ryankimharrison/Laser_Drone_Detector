@@ -1113,7 +1113,7 @@ class Controller:
                  goal_model: Optional[GoalModel] = None,
                  limits: Optional[TravelLimits] = None,
                  gain_k: float = config.CONTROL_GAIN_K,
-                 latency_s: float = config.LATENCY_S):
+                 latency_s: float = config.CONTROL_LEAD_S):
         self.jacobian = jacobian if jacobian is not None else Jacobian.auto()
         self.goal_model = goal_model if goal_model is not None else GoalModel.load()
         self.limits = limits if limits is not None else TravelLimits()
@@ -1192,8 +1192,8 @@ class Controller:
 
         # -- predict to the moment the beam will actually move --------------
         # est is already predicted to est.predicted_to_t; carry it the rest of
-        # the way to t_now + LATENCY_S.  Commanding against where the target is
-        # NOW is commanding against where it was 60 ms ago.
+        # the way to t_now + command lead. Camera and inference delay have
+        # already elapsed between the measurement timestamp and t_now.
         dt = (t_now + self.latency_s) - est.predicted_to_t
         dt = min(dt, MAX_EXTRAPOLATION_S)
         u_hat = est.u + est.du * dt

@@ -176,7 +176,7 @@ def last_seen_before(obs, t: float) -> Optional[Tuple[float, float]]:
     return (float(obs[i, 1]), float(obs[i, 2])) if i >= 0 else None
 
 
-def aim_point_at(obs, T: float, centre, aim_bias: float):
+def aim_point_at(obs, T: float, centre, aim_bias: float, rotation_deg=None):
     """Where the tracker was TRYING to put the aim point at time T.
 
     Not the box centre: `_aim_bias()` pushes toward world-up by a fraction of
@@ -188,13 +188,13 @@ def aim_point_at(obs, T: float, centre, aim_bias: float):
         return centre
     i = int(np.searchsorted(obs[:, 0], T))
     i = min(max(i, 0), len(obs) - 1)
-    up = world_up_in_image(config.NARROW_ROTATION_DEG)
+    up = world_up_in_image(config.NARROW_ROTATION_DEG if rotation_deg is None else rotation_deg)
     extent = _box_extent_along((float(obs[i, 4]), float(obs[i, 5])), up)
     return (centre[0] + float(up[0]) * aim_bias * extent,
             centre[1] + float(up[1]) * aim_bias * extent)
 
 
-def score(rows: List[dict], latency: float, aim_bias: float = 0.0) -> dict:
+def score(rows: List[dict], latency: float, aim_bias: float = 0.0, rotation_deg=None) -> dict:
     obs_list = observations(rows)
     if len(obs_list) < 4:
         return {"n_obs": len(obs_list), "scored": 0}
@@ -207,8 +207,10 @@ def score(rows: List[dict], latency: float, aim_bias: float = 0.0) -> dict:
         if est.get("u") is None or r.get("t") is None:
             continue
         n_est += 1
-        T = r["t"] + latency
-        truth = aim_point_at(obs, T, truth_at(obs, T), aim_bias)
+        T = est.get("predicted_to_t")
+        if T is None:
+            T = r["t"] + latency  # legacy recordings predate explicit prediction targets
+        truth = aim_point_at(obs, T, truth_at(obs, T), aim_bias, rotation_deg)
         if truth is None:
             continue
         lead.append(math.hypot(est["u"] - truth[0], est["v"] - truth[1]))
@@ -302,7 +304,8 @@ def report(run_dir: str, latency: Optional[float] = None,
         latency = float(cfg.get("LATENCY_S", 0.060))
     if aim_bias is None:
         aim_bias = float(cfg["AIM_BIAS_UP_FRAC"]) if "AIM_BIAS_UP_FRAC" in cfg             else LEGACY_AIM_BIAS
-    s = score(rows, latency, aim_bias)
+    s = score(rows, latency, aim_bias, cfg.get('NARROW_ROTATION_DEG'))
+    print("Reference: interpolated detector boxes; diagnostic consistency, not independent ground truth.")
     print("=" * 74)
     print("%s   (%d control rows, LATENCY_S = %.3f, AIM_BIAS = %.2f%s)"
           % (os.path.basename(run_dir), len(rows), latency, aim_bias,

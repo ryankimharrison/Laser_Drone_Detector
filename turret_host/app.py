@@ -123,6 +123,13 @@ FACE_MAX_AGE_S = 0.200
 # refused and the tracker sees a miss -- which is the honest answer.
 WIDE_FALLBACK_MAX_AGE_S = 0.150
 
+
+def wide_evidence_fresh(now, narrow_t, wide_t):
+    """Both age and cross-camera skew must pass; two stale frames cannot agree."""
+    return (0. <= now - wide_t <= WIDE_FALLBACK_MAX_AGE_S
+            and 0. <= now - narrow_t <= WIDE_FALLBACK_MAX_AGE_S
+            and abs(narrow_t - wide_t) <= WIDE_FALLBACK_MAX_AGE_S)
+
 # How long the control loop waits for a new track estimate before it treats the
 # pipeline as STALLED and drops the beam. It is the est_slot wait timeout, and
 # it is deliberately the same order as the interlock's own VEL_FRESH_S (100 ms):
@@ -1833,8 +1840,7 @@ class TurretApp:
             elif self._tracking.is_set() and _wide_ok:
                 wide_item, _ = self.wide_det_slot.get()
                 if wide_item is not None and wide_item.result.targets:
-                    age = abs(item.result.frame_t - wide_item.result.frame_t)
-                    if age <= WIDE_FALLBACK_MAX_AGE_S:
+                    if wide_evidence_fresh(now, item.result.frame_t, wide_item.result.frame_t):
                         mapped = [self._w2n.box(d, config.ASSUMED_RANGE_M)
                                   for d in wide_item.result.targets]
                         targets = self._coarse_targets(mapped, now)
@@ -2216,6 +2222,11 @@ class TurretApp:
                         # WIDE_SEARCH_FPS_TRACKING = 20 instead of 10.
                         "infer_ms": getattr(wide_item.result, "infer_ms", None),
                         "age_ms": (now - wide_item.result.frame_t) * 1000.0,
+                        "frame_t": wide_item.result.frame_t,
+                        "received_t": wide_item.result.received_t,
+                        "infer_done_t": wide_item.result.infer_done_t,
+                        "time_source": wide_item.result.time_source,
+                        "pipeline_delay_s": wide_item.result.pipeline_delay_s,
                         "conf": max((d.conf for d in wide_item.result.targets),
                                     default=None),
                     }
@@ -2226,6 +2237,10 @@ class TurretApp:
                     pose=self._pose if self._pose_valid else None,
                     frame_t=item.frame.t if item and item.frame else None,
                     frame_index=item.frame.index if item and item.frame else None,
+                    received_t=item.frame.received_t if item and item.frame else None,
+                    time_source=item.frame.time_source if item and item.frame else None,
+                    pipeline_delay_s=item.frame.pipeline_delay_s if item and item.frame else None,
+                    infer_done_t=item.result.infer_done_t if item and item.result else None,
                     detections=item.result.targets if item and item.result else None,
                     det_frame_t=(item.result.frame_t
                                  if item and item.result else None),
